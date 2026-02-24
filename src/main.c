@@ -5,11 +5,15 @@
  * - Wakes from sleep
  * - Advertises only the breached value(s) over BLE in CBOR format
  * - Stops advertising when values return to normal
+ * - Logs events to LittleFS: {recycle}|{uptime}A|T{val} or H{val} (breach),
+ *   {recycle}|{uptime}N|T{val} or H{val} (back to normal)
+ * - Recycle counter persists across power cycles
  *
  * Wiring: SHT30-D VDD GND SDA SCL ALERT -> nRF52840 3V3 GND P0.26 P0.27 P1.3
  */
 
 #include <errno.h>
+#include <stdio.h>
 #include <stdbool.h>
 #include <string.h>
 #include <zephyr/kernel.h>
@@ -17,6 +21,7 @@
 #include <zephyr/drivers/sensor.h>
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/gap.h>
+#include <zephyr/fs/fs.h>
 #include <zephyr/sys/util.h>
 #include <zcbor_encode.h>
 #include <zcbor_common.h>
@@ -32,7 +37,16 @@
 #define COMPANY_ID           0xFFFF  /* Use your company ID or 0xFFFF for dev */
 #define MANUF_DATA_BUF_SIZE  30
 
+/* LittleFS paths (fstab mounts at /lfs1) */
+#define PATH_RC       "/lfs1/rc"
+#define PATH_EVENTS   "/lfs1/events.log"
+#define LOG_LINE_MAX  48
+
 static K_SEM_DEFINE(threshold_sem, 0, 1);
+
+/* Persisted across power cycles */
+static uint32_t recycle_count;
+static bool storage_available;
 
 static uint8_t manuf_data[MANUF_DATA_BUF_SIZE];
 static struct bt_data ad[] = {
@@ -55,6 +69,88 @@ static bool temp_breached(const struct sensor_value *temp)
 static bool hum_breached(const struct sensor_value *hum)
 {
 	return hum->val1 < ALERT_HUMIDITY_LO || hum->val1 > ALERT_HUMIDITY_HI;
+}
+
+/* Append one log line: {recycle}|{uptime}{A|N}|{T|H}{value} */
+static void log_append(bool alert, bool is_temp, int val)
+{
+	struct fs_file_t f;
+
+	if (!storage_available) {
+		return;
+	}
+	char line[LOG_LINE_MAX];
+	uint32_t uptime = k_uptime_get_32() / 1000; /* seconds */
+	int n;
+	int ret;
+
+	fs_file_t_init(&f);
+	n = snprintf(line, sizeof(line), "%u|%u%s|%c%d\n",
+		     (unsigned int)recycle_count,
+		     (unsigned int)uptime,
+		     alert ? "A" : "N",
+		     is_temp ? 'T' : 'H',
+		     val);
+	if (n <= 0 || (size_t)n >= sizeof(line)) {
+		return;
+	}
+
+	ret = fs_open(&f, PATH_EVENTS, FS_O_CREATE | FS_O_APPEND | FS_O_WRITE);
+	if (ret != 0) {
+		printk("log_append: fs_open failed %d\n", ret);
+		return;
+	}
+	if (fs_write(&f, line, (size_t)n) != (ssize_t)n) {
+		fs_close(&f);
+		return;
+	}
+	fs_sync(&f);
+	fs_close(&f);
+}
+
+/* Read recycle count, increment, write back. Called once at boot.
+ * If any step fails, storage_available stays false and core logic continues.
+ */
+static void storage_init(void)
+{
+	struct fs_file_t f;
+	char buf[16];
+	ssize_t len;
+	int n;
+	uint32_t val;
+
+	storage_available = false;
+	recycle_count = 1;
+	fs_file_t_init(&f);
+
+	/* Open existing or create empty */
+	if (fs_open(&f, PATH_RC, FS_O_CREATE | FS_O_READ) != 0) {
+		return;
+	}
+
+	len = fs_read(&f, buf, sizeof(buf) - 1);
+	fs_close(&f);
+	if (len > 0) {
+		buf[len] = '\0';
+		n = 0;
+		val = 0;
+		while (buf[n] >= '0' && buf[n] <= '9') {
+			val = val * 10 + (unsigned int)(buf[n] - '0');
+			n++;
+		}
+		recycle_count = val;
+	}
+
+	recycle_count++;
+	if (fs_open(&f, PATH_RC, FS_O_CREATE | FS_O_WRITE) != 0) {
+		return;
+	}
+	len = snprintf(buf, sizeof(buf), "%u\n", (unsigned int)recycle_count);
+	if (len > 0) {
+		fs_write(&f, buf, (size_t)len);
+	}
+	fs_close(&f);
+	storage_available = true;
 }
 
 /* Encode breach data as CBOR map: {"t": temp} and/or {"h": humidity} */
@@ -150,6 +246,14 @@ int main(void)
 
 	printk("SHT30-D: initializing...\n");
 
+	/* Non-volatile recycle counter (increments on each boot) */
+	// storage_init();
+	// if (storage_available) {
+	// 	printk("Storage: ready (recycle count: %u)\n", (unsigned int)recycle_count);
+	// } else {
+	// 	printk("Storage: init failed, continuing without logging\n");
+	// }
+
 	/* Bluetooth */
 	rc = bt_enable(NULL);
 	if (rc) {
@@ -207,6 +311,9 @@ int main(void)
 	printk("SHT30-D: sleeping - will advertise breach via BLE on wake\n\n");
 
 	while (true) {
+		bool temp_breach_logged = false;
+		bool hum_breach_logged = false;
+
 		k_sem_take(&threshold_sem, K_FOREVER);
 
 		rc = sensor_sample_fetch(dev);
@@ -221,6 +328,16 @@ int main(void)
 		printk("*** THRESHOLD BREACH *** %d.%02d C ; %d.%02d %%RH\n",
 		       temp.val1, (int)((temp.val2 < 0 ? -temp.val2 : temp.val2) * 100 / 1000000),
 		       hum.val1, (int)((hum.val2 < 0 ? -hum.val2 : hum.val2) * 100 / 1000000));
+
+		/* Log breach on first detection (initial fetch) */
+		if (temp_breached(&temp)) {
+			log_append(true, true, temp.val1);
+			temp_breach_logged = true;
+		}
+		if (hum_breached(&hum)) {
+			log_append(true, false, hum.val1);
+			hum_breach_logged = true;
+		}
 
 		/* Advertise only breached values in CBOR */
 		rc = ble_start_advertise_breach(&temp, &hum);
@@ -243,12 +360,24 @@ int main(void)
 
 			if (in_range(&temp, &hum)) {
 				ble_stop_advertise();
+				/* Log back-to-normal: separate line per quantity */
+				log_append(false, true, temp.val1);
+				log_append(false, false, hum.val1);
 				printk("*** BACK TO NORMAL *** %d.%02d C ; %d.%02d %%RH\n",
 				       temp.val1, (int)((temp.val2 < 0 ? -temp.val2 : temp.val2) * 100 / 1000000),
 				       hum.val1, (int)((hum.val2 < 0 ? -hum.val2 : hum.val2) * 100 / 1000000));
 				printk("BLE: stopped advertising\n");
 				printk("SHT30-D: sleeping - will wake on next breach\n\n");
 				break;
+			}
+			/* Log breach on first detection during poll (if missed on initial fetch) */
+			if (temp_breached(&temp) && !temp_breach_logged) {
+				log_append(true, true, temp.val1);
+				temp_breach_logged = true;
+			}
+			if (hum_breached(&hum) && !hum_breach_logged) {
+				log_append(true, false, hum.val1);
+				hum_breach_logged = true;
 			}
 			/* Update advertising with current breach values */
 			ble_start_advertise_breach(&temp, &hum);

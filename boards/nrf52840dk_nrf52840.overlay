@@ -9,13 +9,47 @@
  *   SHT30-D ALERT  -> nRF52840 DK P1.3 (Arduino D2)
  *
  * I2C address: 0x44 (ADDR pin to GND). Use 0x45 if ADDR tied to VDD.
+ *
+ * LittleFS on external QSPI flash for event logs and recycle counter.
+ * Remove internal storage_partition to avoid label collision and use QSPI.
  */
+
+/delete-node/ &storage_partition;
 
 &i2c0 {
 	sht3xd: sht3xd@44 {
 		compatible = "sensirion,sht3xd";
 		reg = <0x44>;
-		/* ALERT pin - active high when threshold exceeded */
 		alert-gpios = <&gpio1 3 GPIO_ACTIVE_HIGH>;
+	};
+};
+
+/ {
+	fstab {
+		compatible = "zephyr,fstab";
+		lfs1: lfs1 {
+			compatible = "zephyr,fstab,littlefs";
+			mount-point = "/lfs1";
+			partition = <&lfs1_part>;
+			automount;
+			read-size = <16>;
+			prog-size = <16>;
+			cache-size = <64>;
+			lookahead-size = <32>;
+			block-cycles = <512>;
+		};
+	};
+};
+
+&mx25r64 {
+	partitions {
+		compatible = "fixed-partitions";
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		lfs1_part: partition@0 {
+			label = "storage";
+			reg = <0x00000000 0x00010000>;
+		};
 	};
 };
