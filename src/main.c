@@ -44,6 +44,8 @@
 
 static K_SEM_DEFINE(threshold_sem, 0, 1);
 
+#define STORAGE_INIT_DELAY_MS  2000
+
 /* Persisted across power cycles */
 static uint32_t recycle_count;
 static bool storage_available;
@@ -153,6 +155,19 @@ static void storage_init(void)
 	storage_available = true;
 }
 
+static void storage_init_work_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+	storage_init();
+	if (storage_available) {
+		printk("Storage: ready (recycle count: %u)\n", (unsigned int)recycle_count);
+	} else {
+		printk("Storage: init failed, continuing without logging\n");
+	}
+}
+
+K_WORK_DELAYABLE_DEFINE(storage_init_work, storage_init_work_handler);
+
 /* Encode breach data as CBOR map: {"t": temp} and/or {"h": humidity} */
 static size_t cbor_encode_breach(const struct sensor_value *temp,
 				 const struct sensor_value *hum,
@@ -246,13 +261,10 @@ int main(void)
 
 	printk("SHT30-D: initializing...\n");
 
-	/* Non-volatile recycle counter (increments on each boot) */
-	// storage_init();
-	// if (storage_available) {
-	// 	printk("Storage: ready (recycle count: %u)\n", (unsigned int)recycle_count);
-	// } else {
-	// 	printk("Storage: init failed, continuing without logging\n");
-	// }
+	/* Defer storage init so sensor/trigger/BLE stabilize first (avoids init-order issues) */
+	storage_available = false;
+	recycle_count = 1;
+	k_work_schedule(&storage_init_work, K_MSEC(STORAGE_INIT_DELAY_MS));
 
 	/* Bluetooth */
 	rc = bt_enable(NULL);
