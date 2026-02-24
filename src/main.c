@@ -351,12 +351,14 @@ int main(void)
 			hum_breach_logged = true;
 		}
 
-		/* Advertise only breached values in CBOR */
-		rc = ble_start_advertise_breach(&temp, &hum);
-		if (rc) {
-			printk("BLE advertise start failed: %d\n", rc);
-		} else {
-			printk("BLE: advertising breach (CBOR)\n");
+		/* Advertise only when we have breach data (avoids -EINVAL from empty payload) */
+		if (temp_breached(&temp) || hum_breached(&hum)) {
+			rc = ble_start_advertise_breach(&temp, &hum);
+			if (rc) {
+				printk("BLE advertise start failed: %d\n", rc);
+			} else {
+				printk("BLE: advertising breach (CBOR)\n");
+			}
 		}
 
 		/* Poll until back to normal */
@@ -391,8 +393,10 @@ int main(void)
 				log_append(true, false, hum.val1);
 				hum_breach_logged = true;
 			}
-			/* Update advertising with current breach values */
-			ble_start_advertise_breach(&temp, &hum);
+			/* Update advertising when we have breach data */
+			if (temp_breached(&temp) || hum_breached(&hum)) {
+				ble_start_advertise_breach(&temp, &hum);
+			}
 		}
 	}
 
