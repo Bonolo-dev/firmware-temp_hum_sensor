@@ -1,0 +1,21 @@
+/*
+ * nRF52840 DK overlay for SHT30-D temp/humidity sensor with ALERT interrupt
+ *
+ * Wiring:
+ *   SHT30-D VDD    -> nRF52840 DK 3V3 (or VDD on Arduino header)
+ *   SHT30-D GND    -> nRF52840 DK GND
+ *   SHT30-D SDA    -> nRF52840 DK P0.26 (Arduino A4 / D14 - SDA)
+ *   SHT30-D SCL    -> nRF52840 DK P0.27 (Arduino A5 / D15 - SCL)
+ *   SHT30-D ALERT  -> nRF52840 DK P1.3 (Arduino D2)
+ *
+ * I2C address: 0x44 (ADDR pin to GND). Use 0x45 if ADDR tied to VDD.
+ */
+
+&i2c0 {
+	sht3xd: sht3xd@44 {
+		compatible = "sensirion,sht3xd";
+		reg = <0x44>;
+		/* ALERT pin - active high when threshold exceeded */
+		alert-gpios = <&gpio1 3 GPIO_ACTIVE_HIGH>;
+	};
+};
