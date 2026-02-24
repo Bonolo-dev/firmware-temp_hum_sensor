@@ -1,6 +1,6 @@
 # SHT30-D Temperature/Humidity Sensor with nRF52840 DK
 
-Firmware for the **HKD GY - SHT30-D** (or any SHT30-D compatible) temperature/humidity sensor on the nRF52840 Development Kit. Uses the sensor's ALERT pin to wake the nRF52840 when temperature or humidity exceeds configured thresholds.
+Firmware for the **HKD GY - SHT30-D** (or any SHT30-D compatible) temperature/humidity sensor on the nRF52840 Development Kit. Uses the sensor's ALERT pin to wake the nRF52840 when temperature or humidity exceeds configured thresholds. **Advertises breach data over BLE** in CBOR format for power-efficient transmission.
 
 ## Wiring
 
@@ -35,8 +35,18 @@ Connect a serial terminal at 115200 baud to see output.
 ## Behavior
 
 1. Sensor is initialized and thresholds are set (see `ALERT_TEMP_LO/HI` and `ALERT_HUMIDITY_LO/HI` in `src/main.c`).
-2. The main thread sleeps (`K_FOREVER`) until the ALERT pin asserts.
+2. The main thread sleeps until the ALERT pin asserts (threshold breach).
 3. When temperature or humidity goes outside the configured range, the SHT30-D drives ALERT high.
-4. The nRF52840 wakes, reads the current values, prints them, and sleeps again.
+4. The nRF52840 wakes, reads values, **advertises only the breached value(s) over BLE** in CBOR format, and polls until back to normal.
+5. When values return within range, BLE advertising stops.
 
-Adjust the threshold macros in `src/main.c` for your application.
+## BLE Advertising (CBOR)
+
+On breach, manufacturer data is advertised:
+
+- **Company ID**: 0x05F1 (change `COMPANY_ID` in `src/main.c` for your product).
+- **CBOR payload**: map with `"t"` (temperature in °C) and/or `"h"` (humidity in %RH) — only breached values are included.
+- **Example**: Temp breach only → `{"t": 36.5}`; both → `{"t": 36.5, "h": 85.2}`.
+- Advertising stops when values return to normal.
+
+Use a BLE scanner (e.g. nRF Connect app) and a CBOR decoder to read the data.
