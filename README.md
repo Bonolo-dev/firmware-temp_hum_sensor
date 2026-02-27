@@ -94,6 +94,7 @@ Write a payload in this format to the command characteristic:
 - `01|HL30|HH90` — Set humidity range 30–90% RH
 - `01|TH35` — Set only temp high to 35°C (temp low unchanged)
 - `01|TL10.5|TH30|HL30|HH90` — Set all four thresholds
+- `01|RS` — Reset all thresholds to defaults (15–35°C, 30–70% RH)
 
 **Validation:** Low values must be less than high values for each pair. Invalid combinations return a GATT error.
 

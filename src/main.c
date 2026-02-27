@@ -534,11 +534,12 @@ static ssize_t cmd_char_write(struct bt_conn *conn, const struct bt_gatt_attr *a
 		return len;
 	}
 
-	/* Opcode 01: set thresholds - 01|TL10.5|TH30|HL30|HH90 (partial updates allowed) */
+	/* Opcode 01: set thresholds - 01|TL10.5|TH30|HL30|HH90 or 01|RS to reset to defaults */
 	if (((const char *)buf)[0] == '0' && ((const char *)buf)[1] == '1') {
 		char cmd_buf[CMD_BUF_MAX];
 		char *tok;
 		bool has_tl = false, has_th = false, has_hl = false, has_hh = false;
+		bool has_rs = false;
 		struct sensor_value new_tl;
 		struct sensor_value new_th;
 		int new_hl;
@@ -563,12 +564,15 @@ static ssize_t cmd_char_write(struct bt_conn *conn, const struct bt_gatt_attr *a
 		}
 
 		while ((tok = strtok(NULL, "|")) != NULL) {
-			double fval;
-			char *end;
-
+			if (strlen(tok) == 2 && tok[0] == 'R' && tok[1] == 'S') {
+				has_rs = true;
+				break;
+			}
 			if (strlen(tok) < 3) {
 				continue;
 			}
+			double fval;
+			char *end;
 			fval = strtod(tok + 2, &end);
 			if (end == tok + 2) {
 				return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
@@ -587,6 +591,16 @@ static ssize_t cmd_char_write(struct bt_conn *conn, const struct bt_gatt_attr *a
 				has_hh = true;
 				new_hh = (int)fval;
 			}
+		}
+
+		if (has_rs) {
+			new_tl.val1 = DEFAULT_TEMP_LO;
+			new_tl.val2 = 0;
+			new_th.val1 = DEFAULT_TEMP_HI;
+			new_th.val2 = 0;
+			new_hl = DEFAULT_HUMIDITY_LO;
+			new_hh = DEFAULT_HUMIDITY_HI;
+			has_tl = has_th = has_hl = has_hh = true;
 		}
 
 		/* Validation: low must be < high for each pair */
