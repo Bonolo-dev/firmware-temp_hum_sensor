@@ -7,7 +7,7 @@
  * - Stops advertising when values return to normal
  * - Logs events to LittleFS: {recycle}|{uptime}A|T{val} or H{val} (breach),
  *   {recycle}|{uptime}N|T{val} or H{val} (back to normal)
- * - Recycle counter persists across power cycles
+ * - Recycle counter and thresholds persist across power cycles (LittleFS)
  *
  * Button 1 (SW1): Wake from idle, read T/H, log to events.log, advertise (connectable)
  * so user can connect via BLE and fetch events.log (write "00" to command char).
@@ -31,6 +31,7 @@
 #include <zephyr/bluetooth/gatt.h>
 #include <zephyr/bluetooth/uuid.h>
 #include <zephyr/fs/fs.h>
+#include <zephyr/sys/reboot.h>
 #include <zephyr/sys/util.h>
 #include <zcbor_encode.h>
 #include <zcbor_common.h>
@@ -49,9 +50,10 @@
 #define MANUF_DATA_BUF_SIZE  30
 
 /* LittleFS paths (fstab mounts at /lfs1) */
-#define PATH_RC       "/lfs1/rc"
-#define PATH_EVENTS   "/lfs1/events.log"
-#define LOG_LINE_MAX  48
+#define PATH_RC         "/lfs1/rc"
+#define PATH_EVENTS     "/lfs1/events.log"
+#define PATH_THRESHOLDS "/lfs1/thresholds"
+#define LOG_LINE_MAX    48
 
 /* Button 1 (SW1 on nRF52840 DK) - wake from idle for manual reading */
 #define SW1_NODE     DT_ALIAS(sw0)
@@ -71,6 +73,7 @@ static K_SEM_DEFINE(threshold_sem, 0, 1);
 static K_SEM_DEFINE(button_sem, 0, 1);
 
 #define STORAGE_INIT_DELAY_MS  2000
+#define REBOOT_DELAY_MS        1000  /* Defer reboot so BLE write completes */
 
 /* Persisted across power cycles */
 static uint32_t recycle_count;
@@ -83,8 +86,22 @@ static int alert_humidity_lo = DEFAULT_HUMIDITY_LO;
 static int alert_humidity_hi = DEFAULT_HUMIDITY_HI;
 static K_MUTEX_DEFINE(threshold_mutex);
 
-/* Sensor device - set in main() for runtime threshold updates via BLE */
+/* Sensor device - set in main() */
 static const struct device *sensor_dev;
+
+/* Forward decl */
+static void thresholds_save(void);
+
+/* Save thresholds + reboot - must run in work queue, not BLE callback.
+ * BLE callback has limited stack and FS ops can block/deadlock there. */
+static void save_and_reboot_work_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+	thresholds_save();
+	printk("BLE: saved, rebooting to apply thresholds\n");
+	sys_reboot(SYS_REBOOT_COLD);
+}
+static K_WORK_DELAYABLE_DEFINE(save_and_reboot_work, save_and_reboot_work_handler);
 
 static uint8_t manuf_data[MANUF_DATA_BUF_SIZE];
 static struct bt_data ad[] = {
@@ -231,12 +248,123 @@ static void storage_init(void)
 	storage_available = true;
 }
 
+/* Forward decl for use in thresholds_load */
+static void double_to_sensor_value(double v, struct sensor_value *out);
+
+/* Save current thresholds to LittleFS. Call when thresholds are updated via BLE. */
+static void thresholds_save(void)
+{
+	if (!storage_available) {
+		return;
+	}
+	struct fs_file_t f;
+	char buf[48];
+	int n;
+	int tl_frac, th_frac;
+
+	k_mutex_lock(&threshold_mutex, K_FOREVER);
+	tl_frac = (int)((alert_temp_lo_val.val2 < 0 ? -alert_temp_lo_val.val2 :
+			 alert_temp_lo_val.val2) * 100 / 1000000);
+	th_frac = (int)((alert_temp_hi_val.val2 < 0 ? -alert_temp_hi_val.val2 :
+			 alert_temp_hi_val.val2) * 100 / 1000000);
+	n = snprintf(buf, sizeof(buf), "%d.%02d %d.%02d %d %d\n",
+		     alert_temp_lo_val.val1, tl_frac,
+		     alert_temp_hi_val.val1, th_frac,
+		     alert_humidity_lo, alert_humidity_hi);
+	k_mutex_unlock(&threshold_mutex);
+	if (n <= 0 || (size_t)n >= sizeof(buf)) {
+		return;
+	}
+
+	fs_file_t_init(&f);
+	if (fs_open(&f, PATH_THRESHOLDS, FS_O_CREATE | FS_O_WRITE) != 0) {
+		return;
+	}
+	if (fs_write(&f, buf, (size_t)n) != (ssize_t)n) {
+		fs_close(&f);
+		return;
+	}
+	fs_sync(&f);
+	fs_close(&f);
+}
+
+/* Load thresholds from LittleFS. Returns true if loaded and applied. */
+static bool thresholds_load(void)
+{
+	struct fs_file_t f;
+	char buf[48];
+	ssize_t len;
+	int tl_val, tl_frac, th_val, th_frac, hl, hh;
+	int n;
+
+	fs_file_t_init(&f);
+	if (fs_open(&f, PATH_THRESHOLDS, FS_O_READ) != 0) {
+		return false;
+	}
+	len = fs_read(&f, buf, sizeof(buf) - 1);
+	fs_close(&f);
+	if (len <= 0) {
+		return false;
+	}
+	buf[len] = '\0';
+	n = 0;
+	if (sscanf(buf, "%d.%d %d.%d %d %d%n",
+		   &tl_val, &tl_frac, &th_val, &th_frac, &hl, &hh, &n) < 6) {
+		return false;
+	}
+	/* Basic validation: low < high */
+	if (tl_val > th_val || (tl_val == th_val && tl_frac >= th_frac) ||
+	    hl >= hh || hl < 0 || hh > 100) {
+		return false;
+	}
+
+	k_mutex_lock(&threshold_mutex, K_FOREVER);
+	alert_temp_lo_val.val1 = tl_val;
+	alert_temp_lo_val.val2 = (int32_t)tl_frac * 1000000 / 100;
+	alert_temp_hi_val.val1 = th_val;
+	alert_temp_hi_val.val2 = (int32_t)th_frac * 1000000 / 100;
+	alert_humidity_lo = hl;
+	alert_humidity_hi = hh;
+	k_mutex_unlock(&threshold_mutex);
+
+	return true;
+}
+
 static void storage_init_work_handler(struct k_work *work)
 {
 	ARG_UNUSED(work);
 	storage_init();
 	if (storage_available) {
 		printk("Storage: ready (recycle count: %u)\n", (unsigned int)recycle_count);
+		/* Load persisted thresholds and apply to sensor if available */
+		if (thresholds_load() && sensor_dev && device_is_ready(sensor_dev)) {
+			struct sensor_value t_lo, t_hi, h_lo, h_hi;
+
+			k_mutex_lock(&threshold_mutex, K_FOREVER);
+			t_lo = alert_temp_lo_val;
+			t_hi = alert_temp_hi_val;
+			h_lo.val1 = alert_humidity_lo;
+			h_lo.val2 = 0;
+			h_hi.val1 = alert_humidity_hi;
+			h_hi.val2 = 0;
+			k_mutex_unlock(&threshold_mutex);
+
+			if (sensor_attr_set(sensor_dev, SENSOR_CHAN_AMBIENT_TEMP,
+					    SENSOR_ATTR_LOWER_THRESH, &t_lo) == 0 &&
+			    sensor_attr_set(sensor_dev, SENSOR_CHAN_AMBIENT_TEMP,
+					    SENSOR_ATTR_UPPER_THRESH, &t_hi) == 0 &&
+			    sensor_attr_set(sensor_dev, SENSOR_CHAN_HUMIDITY,
+					    SENSOR_ATTR_LOWER_THRESH, &h_lo) == 0 &&
+			    sensor_attr_set(sensor_dev, SENSOR_CHAN_HUMIDITY,
+					    SENSOR_ATTR_UPPER_THRESH, &h_hi) == 0) {
+				printk("Thresholds: loaded from storage (T %d.%d-%d.%d C, H %d-%d %%RH)\n",
+				       t_lo.val1,
+				       (int)((t_lo.val2 < 0 ? -t_lo.val2 : t_lo.val2) * 10 / 1000000),
+				       t_hi.val1,
+				       (int)((t_hi.val2 < 0 ? -t_hi.val2 : t_hi.val2) * 10 / 1000000),
+				       h_lo.val1, h_hi.val1);
+			}
+		}
 	} else {
 		printk("Storage: init failed, continuing without logging\n");
 	}
@@ -466,8 +594,11 @@ static ssize_t cmd_char_write(struct bt_conn *conn, const struct bt_gatt_attr *a
 			float tl_f = sensor_value_to_float(&new_tl);
 			float th_f = sensor_value_to_float(&new_th);
 			if (has_tl && has_th && tl_f >= th_f) {
-				printk("BLE: threshold error: TL (%.1f) must be < TH (%.1f)\n",
-				       (double)tl_f, (double)th_f);
+				printk("BLE: threshold error: TL (%d.%d) must be < TH (%d.%d)\n",
+				       new_tl.val1,
+				       (int)((new_tl.val2 < 0 ? -new_tl.val2 : new_tl.val2) * 10 / 1000000),
+				       new_th.val1,
+				       (int)((new_th.val2 < 0 ? -new_th.val2 : new_th.val2) * 10 / 1000000));
 				return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
 			}
 			if (has_hl && has_hh && new_hl >= new_hh) {
@@ -511,35 +642,16 @@ static ssize_t cmd_char_write(struct bt_conn *conn, const struct bt_gatt_attr *a
 		}
 		k_mutex_unlock(&threshold_mutex);
 
-		/* Apply to hardware sensor */
-		if (sensor_dev && device_is_ready(sensor_dev)) {
-			struct sensor_value t_lo = alert_temp_lo_val;
-			struct sensor_value t_hi = alert_temp_hi_val;
-			struct sensor_value h_lo = { .val1 = alert_humidity_lo, .val2 = 0 };
-			struct sensor_value h_hi = { .val1 = alert_humidity_hi, .val2 = 0 };
-
-			if (sensor_attr_set(sensor_dev, SENSOR_CHAN_AMBIENT_TEMP,
-					   SENSOR_ATTR_LOWER_THRESH, &t_lo) != 0) {
-				printk("BLE: sensor_attr_set temp low failed\n");
-			}
-			if (sensor_attr_set(sensor_dev, SENSOR_CHAN_AMBIENT_TEMP,
-					   SENSOR_ATTR_UPPER_THRESH, &t_hi) != 0) {
-				printk("BLE: sensor_attr_set temp high failed\n");
-			}
-			if (sensor_attr_set(sensor_dev, SENSOR_CHAN_HUMIDITY,
-					   SENSOR_ATTR_LOWER_THRESH, &h_lo) != 0) {
-				printk("BLE: sensor_attr_set humidity low failed\n");
-			}
-			if (sensor_attr_set(sensor_dev, SENSOR_CHAN_HUMIDITY,
-					   SENSOR_ATTR_UPPER_THRESH, &h_hi) != 0) {
-				printk("BLE: sensor_attr_set humidity high failed\n");
-			}
-		}
-
-		printk("BLE: thresholds set (T %.1f-%.1f C, H %d-%d %%RH)\n",
-		       (double)sensor_value_to_float(&alert_temp_lo_val),
-		       (double)sensor_value_to_float(&alert_temp_hi_val),
+		printk("BLE: thresholds set (T %d.%d-%d.%d C, H %d-%d %%RH)\n",
+		       alert_temp_lo_val.val1,
+		       (int)((alert_temp_lo_val.val2 < 0 ? -alert_temp_lo_val.val2 :
+			      alert_temp_lo_val.val2) * 10 / 1000000),
+		       alert_temp_hi_val.val1,
+		       (int)((alert_temp_hi_val.val2 < 0 ? -alert_temp_hi_val.val2 :
+			      alert_temp_hi_val.val2) * 10 / 1000000),
 		       alert_humidity_lo, alert_humidity_hi);
+		printk("BLE: scheduling save & reboot in %d ms\n", REBOOT_DELAY_MS);
+		k_work_schedule(&save_and_reboot_work, K_MSEC(REBOOT_DELAY_MS));
 		return len;
 	}
 
@@ -824,13 +936,30 @@ int main(void)
 			}
 		}
 
-		/* Poll until back to normal */
+		/* Poll until back to normal (or button press to exit early) */
 		while (true) {
+#if DT_NODE_HAS_PROP(SW1_NODE, gpios)
+			/* Poll for button or timeout */
+			struct k_poll_event inner_ev[] = {
+				K_POLL_EVENT_STATIC_INITIALIZER(K_POLL_TYPE_SEM_AVAILABLE,
+								K_POLL_MODE_NOTIFY_ONLY,
+								&button_sem, 0),
+			};
+			for (int i = 0; i < ARRAY_SIZE(inner_ev); i++) {
+				inner_ev[i].state = K_POLL_STATE_NOT_READY;
+			}
+			rc = k_poll(inner_ev, ARRAY_SIZE(inner_ev), K_MSEC(POLL_INTERVAL_MS));
+			if (rc == 0 && inner_ev[0].state == K_POLL_STATE_SEM_AVAILABLE) {
+				break;  /* Button - outer loop handles */
+			}
+#else
 			k_sleep(K_MSEC(POLL_INTERVAL_MS));
+#endif
 
 			rc = sensor_sample_fetch(dev);
 			if (rc) {
-				continue;
+				printk("SHT30-D: fetch failed in poll loop: %d\n", rc);
+				break;  /* Exit to k_poll so we can respond to button */
 			}
 			sensor_channel_get(dev, SENSOR_CHAN_AMBIENT_TEMP, &temp);
 			sensor_channel_get(dev, SENSOR_CHAN_HUMIDITY, &hum);

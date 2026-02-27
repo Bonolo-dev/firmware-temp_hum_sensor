@@ -97,11 +97,13 @@ Write a payload in this format to the command characteristic:
 
 **Validation:** Low values must be less than high values for each pair. Invalid combinations return a GATT error.
 
+**Persistence:** Thresholds are saved to LittleFS (`/lfs1/thresholds`) when updated via BLE. The MCU then reboots to apply the new values cleanly. On boot, persisted thresholds are loaded ~2 seconds after startup (when storage is ready) and applied to the sensor. If no persisted file exists, the defaults (15–35°C, 30–70% RH) are used.
+
 ---
 
 ## Events Log Format
 
-`events.log` is stored in LittleFS at `/lfs1/events.log` (external QSPI flash). Each line:
+`events.log` is stored in LittleFS at `/lfs1/events.log` (external QSPI flash). Thresholds and the recycle counter are also persisted at `/lfs1/thresholds` and `/lfs1/rc`. Each log line:
 
 ```
 {recycle}|{uptime}{type}|{T|H}{value}
