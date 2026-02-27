@@ -74,11 +74,13 @@ To interact with the device over BLE, **press Button 1** first to start connecta
 2. Discover the custom GATT service (128‑bit UUID).
 3. **Write** commands to the **command characteristic**, then read from the **events characteristic** when applicable.
 
-#### Opcode 00 – Request Events Log
+#### Opcode 00 – Request Events Log / Delete Logs
 
 1. **Write** ASCII `"00"` (2 bytes: `0x30 0x30`) to the command characteristic.
 2. **Read** the events characteristic to retrieve `events.log` content.
 3. Use long read (blob read) with offset to fetch the full file if it exceeds one ATT_MTU.
+
+**Delete all logs:** Write `00|RS` (5 bytes) to delete `events.log`. The file is removed from LittleFS immediately.
 
 #### Opcode 01 – Set Thresholds
 

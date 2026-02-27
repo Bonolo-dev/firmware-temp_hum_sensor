@@ -103,6 +103,21 @@ static void save_and_reboot_work_handler(struct k_work *work)
 }
 static K_WORK_DELAYABLE_DEFINE(save_and_reboot_work, save_and_reboot_work_handler);
 
+/* Delete events.log - runs in work queue (not BLE callback) */
+static void delete_logs_work_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+	int ret = fs_unlink(PATH_EVENTS);
+	if (ret == 0) {
+		printk("BLE: events.log deleted\n");
+	} else if (ret == -ENOENT) {
+		printk("BLE: events.log already absent\n");
+	} else {
+		printk("BLE: fs_unlink failed %d\n", ret);
+	}
+}
+static K_WORK_DELAYABLE_DEFINE(delete_logs_work, delete_logs_work_handler);
+
 static uint8_t manuf_data[MANUF_DATA_BUF_SIZE];
 static struct bt_data ad[] = {
 	BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
@@ -510,8 +525,8 @@ static void double_to_sensor_value(double v, struct sensor_value *out)
 }
 
 /* --- GATT: write commands to command char ---
- * Opcode 00: request events.log (write "00", then read events characteristic)
- * Opcode 01: set thresholds - format 01|TL10.5|TH30|HL30|HH90 (any subset of TL,TH,HL,HH)
+ * Opcode 00: request events.log (write "00") or delete logs (write "00|RS")
+ * Opcode 01: set thresholds - format 01|TL10.5|TH30|HL30|HH90 or 01|RS for defaults
  */
 static ssize_t cmd_char_write(struct bt_conn *conn, const struct bt_gatt_attr *attr,
 			      const void *buf, uint16_t len, uint16_t offset, uint8_t flags)
@@ -527,10 +542,18 @@ static ssize_t cmd_char_write(struct bt_conn *conn, const struct bt_gatt_attr *a
 		return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
 	}
 
-	/* Opcode 00: request events.log */
+	/* Opcode 00: request events.log, or 00|RS to delete all logs */
 	if (((const char *)buf)[0] == '0' && ((const char *)buf)[1] == '0') {
-		log_requested = true;
-		printk("BLE: user requested events.log (code 00)\n");
+		if (len >= 5 && ((const char *)buf)[2] == '|' &&
+		    ((const char *)buf)[3] == 'R' && ((const char *)buf)[4] == 'S') {
+			/* 00|RS - delete events.log */
+			printk("BLE: user requested log delete (code 00|RS)\n");
+			k_work_schedule(&delete_logs_work, K_NO_WAIT);
+		} else {
+			/* plain 00 - request events.log for read */
+			log_requested = true;
+			printk("BLE: user requested events.log (code 00)\n");
+		}
 		return len;
 	}
 
