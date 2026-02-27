@@ -106,7 +106,9 @@ Write a payload in this format to the command characteristic:
 
 ## Events Log Format
 
-`events.log` is stored in LittleFS at `/lfs1/events.log` (external QSPI flash). Thresholds and the recycle counter are also persisted at `/lfs1/thresholds` and `/lfs1/rc`. Each log line:
+`events.log` is stored in LittleFS at `/lfs1/events.log` (external QSPI flash). Thresholds and the recycle counter are also persisted at `/lfs1/thresholds` and `/lfs1/rc`.
+
+**FIFO rotation:** The log is capped at 16 KiB. When full, the oldest lines are dropped and the newest entry is appended. This prevents unbounded storage growth.
 
 ```
 {recycle}|{uptime}{type}|{T|H}{value}

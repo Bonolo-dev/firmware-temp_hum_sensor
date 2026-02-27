@@ -54,6 +54,7 @@
 #define PATH_EVENTS     "/lfs1/events.log"
 #define PATH_THRESHOLDS "/lfs1/thresholds"
 #define LOG_LINE_MAX    48
+#define MAX_LOG_BYTES   16384  /* FIFO: when full, drop oldest lines */
 
 /* Button 1 (SW1 on nRF52840 DK) - wake from idle for manual reading */
 #define SW1_NODE     DT_ALIAS(sw0)
@@ -181,10 +182,12 @@ static bool hum_breached(const struct sensor_value *hum)
 }
 
 /* Append one log line: {recycle}|{uptime}{A|N|M}|{T|H}{value}
- * A=alert/breach, N=back to normal, M=manual (Button 1) */
+ * A=alert/breach, N=back to normal, M=manual (Button 1)
+ * FIFO: when log exceeds MAX_LOG_BYTES, drop oldest lines to make room. */
 static void log_append_type(char type, bool is_temp, int val)
 {
 	struct fs_file_t f;
+	struct fs_dirent ent;
 
 	if (!storage_available) {
 		return;
@@ -194,7 +197,6 @@ static void log_append_type(char type, bool is_temp, int val)
 	int n;
 	int ret;
 
-	fs_file_t_init(&f);
 	n = snprintf(line, sizeof(line), "%u|%u%c|%c%d\n",
 		     (unsigned int)recycle_count,
 		     (unsigned int)uptime,
@@ -205,9 +207,86 @@ static void log_append_type(char type, bool is_temp, int val)
 		return;
 	}
 
-	ret = fs_open(&f, PATH_EVENTS, FS_O_CREATE | FS_O_APPEND | FS_O_WRITE);
+	size_t current_size = 0;
+	ret = fs_stat(PATH_EVENTS, &ent);
+	if (ret == 0) {
+		current_size = ent.size;
+	}
+
+	/* Simple append when under limit */
+	if (current_size + (size_t)n <= MAX_LOG_BYTES) {
+		fs_file_t_init(&f);
+		ret = fs_open(&f, PATH_EVENTS, FS_O_CREATE | FS_O_APPEND | FS_O_WRITE);
+		if (ret != 0) {
+			printk("log_append: fs_open failed %d\n", ret);
+			return;
+		}
+		if (fs_write(&f, line, (size_t)n) != (ssize_t)n) {
+			fs_close(&f);
+			return;
+		}
+		fs_sync(&f);
+		fs_close(&f);
+		return;
+	}
+
+	/* FIFO rotate: read tail, drop oldest lines, rewrite */
+	static uint8_t log_buf[MAX_LOG_BYTES];
+	ssize_t read_len;
+	size_t skip = 0;
+
+	fs_file_t_init(&f);
+	ret = fs_open(&f, PATH_EVENTS, FS_O_READ);
 	if (ret != 0) {
-		printk("log_append: fs_open failed %d\n", ret);
+		printk("log_append: rotate read failed %d\n", ret);
+		return;
+	}
+
+	if (current_size > MAX_LOG_BYTES) {
+		/* Read only the newest MAX bytes */
+		ret = fs_seek(&f, (off_t)(current_size - MAX_LOG_BYTES), FS_SEEK_SET);
+		if (ret != 0) {
+			fs_close(&f);
+			return;
+		}
+	}
+
+	read_len = fs_read(&f, log_buf, MAX_LOG_BYTES);
+	fs_close(&f);
+	if (read_len <= 0) {
+		return;
+	}
+
+	/* If we sought mid-file, skip partial line at start */
+	if (current_size > MAX_LOG_BYTES) {
+		while (skip < (size_t)read_len && log_buf[skip] != '\n') {
+			skip++;
+		}
+		if (skip < (size_t)read_len) {
+			skip++;
+		}
+	}
+
+	/* Drop oldest complete lines until new line fits */
+	while ((size_t)read_len - skip + (size_t)n > MAX_LOG_BYTES && skip < (size_t)read_len) {
+		while (skip < (size_t)read_len && log_buf[skip] != '\n') {
+			skip++;
+		}
+		if (skip < (size_t)read_len) {
+			skip++;
+		}
+	}
+
+	size_t kept = (size_t)read_len - skip;
+
+	fs_file_t_init(&f);
+	ret = fs_open(&f, PATH_EVENTS, FS_O_CREATE | FS_O_WRITE | FS_O_TRUNC);
+	if (ret != 0) {
+		printk("log_append: rotate write failed %d\n", ret);
+		return;
+	}
+	if (kept > 0 && fs_write(&f, log_buf + skip, kept) != (ssize_t)kept) {
+		fs_close(&f);
 		return;
 	}
 	if (fs_write(&f, line, (size_t)n) != (ssize_t)n) {
