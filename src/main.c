@@ -17,6 +17,7 @@
 
 #include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <stdbool.h>
 #include <string.h>
 #include <zephyr/kernel.h>
@@ -34,11 +35,12 @@
 #include <zcbor_encode.h>
 #include <zcbor_common.h>
 
-/* Thresholds - adjust for your application */
-#define ALERT_TEMP_LO        15
-#define ALERT_TEMP_HI        35
-#define ALERT_HUMIDITY_LO    30
-#define ALERT_HUMIDITY_HI    70
+/* Default thresholds - can be overridden via BLE (opcode 01) */
+#define DEFAULT_TEMP_LO        15
+#define DEFAULT_TEMP_HI        35
+#define DEFAULT_HUMIDITY_LO    30
+#define DEFAULT_HUMIDITY_HI    70
+#define CMD_BUF_MAX            64
 #define POLL_INTERVAL_MS      2000
 #define MANUAL_ADV_TIMEOUT_MS 60000  /* Stay connectable with T/H for 60s after Button 1 */
 
@@ -74,6 +76,16 @@ static K_SEM_DEFINE(button_sem, 0, 1);
 static uint32_t recycle_count;
 static bool storage_available;
 
+/* Runtime thresholds (configurable via BLE opcode 01) - protected by threshold_mutex */
+static struct sensor_value alert_temp_lo_val = { .val1 = DEFAULT_TEMP_LO, .val2 = 0 };
+static struct sensor_value alert_temp_hi_val = { .val1 = DEFAULT_TEMP_HI, .val2 = 0 };
+static int alert_humidity_lo = DEFAULT_HUMIDITY_LO;
+static int alert_humidity_hi = DEFAULT_HUMIDITY_HI;
+static K_MUTEX_DEFINE(threshold_mutex);
+
+/* Sensor device - set in main() for runtime threshold updates via BLE */
+static const struct device *sensor_dev;
+
 static uint8_t manuf_data[MANUF_DATA_BUF_SIZE];
 static struct bt_data ad[] = {
 	BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
@@ -96,18 +108,44 @@ static const struct bt_data sd_conn[] = {
 
 static bool in_range(const struct sensor_value *temp, const struct sensor_value *hum)
 {
-	return temp->val1 >= ALERT_TEMP_LO && temp->val1 <= ALERT_TEMP_HI &&
-	       hum->val1 >= ALERT_HUMIDITY_LO && hum->val1 <= ALERT_HUMIDITY_HI;
+	float t_float, t_lo, t_hi;
+	int h_lo, h_hi;
+
+	k_mutex_lock(&threshold_mutex, K_FOREVER);
+	t_lo = sensor_value_to_float(&alert_temp_lo_val);
+	t_hi = sensor_value_to_float(&alert_temp_hi_val);
+	h_lo = alert_humidity_lo;
+	h_hi = alert_humidity_hi;
+	k_mutex_unlock(&threshold_mutex);
+
+	t_float = sensor_value_to_float(temp);
+	return t_float >= t_lo && t_float <= t_hi &&
+	       hum->val1 >= h_lo && hum->val1 <= h_hi;
 }
 
 static bool temp_breached(const struct sensor_value *temp)
 {
-	return temp->val1 < ALERT_TEMP_LO || temp->val1 > ALERT_TEMP_HI;
+	float t_float, t_lo, t_hi;
+
+	k_mutex_lock(&threshold_mutex, K_FOREVER);
+	t_lo = sensor_value_to_float(&alert_temp_lo_val);
+	t_hi = sensor_value_to_float(&alert_temp_hi_val);
+	k_mutex_unlock(&threshold_mutex);
+
+	t_float = sensor_value_to_float(temp);
+	return t_float < t_lo || t_float > t_hi;
 }
 
 static bool hum_breached(const struct sensor_value *hum)
 {
-	return hum->val1 < ALERT_HUMIDITY_LO || hum->val1 > ALERT_HUMIDITY_HI;
+	int h_lo, h_hi;
+
+	k_mutex_lock(&threshold_mutex, K_FOREVER);
+	h_lo = alert_humidity_lo;
+	h_hi = alert_humidity_hi;
+	k_mutex_unlock(&threshold_mutex);
+
+	return hum->val1 < h_lo || hum->val1 > h_hi;
 }
 
 /* Append one log line: {recycle}|{uptime}{A|N|M}|{T|H}{value}
@@ -276,7 +314,7 @@ static int ble_start_advertise_connectable(const struct sensor_value *temp,
 		(void)bt_le_adv_stop();
 		ad_active = false;
 	}
-	int err = bt_le_adv_start(BT_LE_ADV_CONN, ad_conn, ARRAY_SIZE(ad_conn),
+	int err = bt_le_adv_start(BT_LE_ADV_CONN_FAST_2, ad_conn, ARRAY_SIZE(ad_conn),
 				 sd_conn, ARRAY_SIZE(sd_conn));
 	if (!err) {
 		ad_active = true;
@@ -336,7 +374,17 @@ static void trigger_handler(const struct device *dev,
 	k_sem_give(&threshold_sem);
 }
 
-/* --- GATT: write "00" to command, read events.log from events characteristic --- */
+/* Convert double to sensor_value (val1=integer, val2=frac in micro-units) */
+static void double_to_sensor_value(double v, struct sensor_value *out)
+{
+	out->val1 = (int32_t)v;
+	out->val2 = (int32_t)((v - (double)out->val1) * 1000000.0);
+}
+
+/* --- GATT: write commands to command char ---
+ * Opcode 00: request events.log (write "00", then read events characteristic)
+ * Opcode 01: set thresholds - format 01|TL10.5|TH30|HL30|HH90 (any subset of TL,TH,HL,HH)
+ */
 static ssize_t cmd_char_write(struct bt_conn *conn, const struct bt_gatt_attr *attr,
 			      const void *buf, uint16_t len, uint16_t offset, uint8_t flags)
 {
@@ -347,12 +395,155 @@ static ssize_t cmd_char_write(struct bt_conn *conn, const struct bt_gatt_attr *a
 	if (offset > 0) {
 		return BT_GATT_ERR(BT_ATT_ERR_INVALID_OFFSET);
 	}
-	if (len >= 2 && ((const char *)buf)[0] == '0' && ((const char *)buf)[1] == '0') {
+	if (len < 2) {
+		return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
+	}
+
+	/* Opcode 00: request events.log */
+	if (((const char *)buf)[0] == '0' && ((const char *)buf)[1] == '0') {
 		log_requested = true;
 		printk("BLE: user requested events.log (code 00)\n");
 		return len;
 	}
-	return len;
+
+	/* Opcode 01: set thresholds - 01|TL10.5|TH30|HL30|HH90 (partial updates allowed) */
+	if (((const char *)buf)[0] == '0' && ((const char *)buf)[1] == '1') {
+		char cmd_buf[CMD_BUF_MAX];
+		char *tok;
+		bool has_tl = false, has_th = false, has_hl = false, has_hh = false;
+		struct sensor_value new_tl;
+		struct sensor_value new_th;
+		int new_hl;
+		int new_hh;
+
+		if (len >= CMD_BUF_MAX) {
+			return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
+		}
+		memcpy(cmd_buf, buf, len);
+		cmd_buf[len] = '\0';
+
+		k_mutex_lock(&threshold_mutex, K_FOREVER);
+		new_tl = alert_temp_lo_val;
+		new_th = alert_temp_hi_val;
+		new_hl = alert_humidity_lo;
+		new_hh = alert_humidity_hi;
+		k_mutex_unlock(&threshold_mutex);
+
+		tok = strtok(cmd_buf, "|");
+		if (!tok || strlen(tok) != 2 || tok[0] != '0' || tok[1] != '1') {
+			return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
+		}
+
+		while ((tok = strtok(NULL, "|")) != NULL) {
+			double fval;
+			char *end;
+
+			if (strlen(tok) < 3) {
+				continue;
+			}
+			fval = strtod(tok + 2, &end);
+			if (end == tok + 2) {
+				return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
+			}
+
+			if (tok[0] == 'T' && tok[1] == 'L') {
+				has_tl = true;
+				double_to_sensor_value(fval, &new_tl);
+			} else if (tok[0] == 'T' && tok[1] == 'H') {
+				has_th = true;
+				double_to_sensor_value(fval, &new_th);
+			} else if (tok[0] == 'H' && tok[1] == 'L') {
+				has_hl = true;
+				new_hl = (int)fval;
+			} else if (tok[0] == 'H' && tok[1] == 'H') {
+				has_hh = true;
+				new_hh = (int)fval;
+			}
+		}
+
+		/* Validation: low must be < high for each pair */
+		{
+			float tl_f = sensor_value_to_float(&new_tl);
+			float th_f = sensor_value_to_float(&new_th);
+			if (has_tl && has_th && tl_f >= th_f) {
+				printk("BLE: threshold error: TL (%.1f) must be < TH (%.1f)\n",
+				       (double)tl_f, (double)th_f);
+				return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
+			}
+			if (has_hl && has_hh && new_hl >= new_hh) {
+				printk("BLE: threshold error: HL (%d) must be < HH (%d)\n",
+				       new_hl, new_hh);
+				return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
+			}
+			/* Validate new values against existing if only one of pair is updated */
+			if (has_tl && !has_th) {
+				float th_f_cur = sensor_value_to_float(&alert_temp_hi_val);
+				if (tl_f >= th_f_cur) {
+					return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
+				}
+			}
+			if (has_th && !has_tl) {
+				float tl_f_cur = sensor_value_to_float(&alert_temp_lo_val);
+				if (tl_f_cur >= th_f) {
+					return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
+				}
+			}
+			if (has_hl && !has_hh && new_hl >= alert_humidity_hi) {
+				return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
+			}
+			if (has_hh && !has_hl && alert_humidity_lo >= new_hh) {
+				return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
+			}
+		}
+
+		k_mutex_lock(&threshold_mutex, K_FOREVER);
+		if (has_tl) {
+			alert_temp_lo_val = new_tl;
+		}
+		if (has_th) {
+			alert_temp_hi_val = new_th;
+		}
+		if (has_hl) {
+			alert_humidity_lo = new_hl;
+		}
+		if (has_hh) {
+			alert_humidity_hi = new_hh;
+		}
+		k_mutex_unlock(&threshold_mutex);
+
+		/* Apply to hardware sensor */
+		if (sensor_dev && device_is_ready(sensor_dev)) {
+			struct sensor_value t_lo = alert_temp_lo_val;
+			struct sensor_value t_hi = alert_temp_hi_val;
+			struct sensor_value h_lo = { .val1 = alert_humidity_lo, .val2 = 0 };
+			struct sensor_value h_hi = { .val1 = alert_humidity_hi, .val2 = 0 };
+
+			if (sensor_attr_set(sensor_dev, SENSOR_CHAN_AMBIENT_TEMP,
+					   SENSOR_ATTR_LOWER_THRESH, &t_lo) != 0) {
+				printk("BLE: sensor_attr_set temp low failed\n");
+			}
+			if (sensor_attr_set(sensor_dev, SENSOR_CHAN_AMBIENT_TEMP,
+					   SENSOR_ATTR_UPPER_THRESH, &t_hi) != 0) {
+				printk("BLE: sensor_attr_set temp high failed\n");
+			}
+			if (sensor_attr_set(sensor_dev, SENSOR_CHAN_HUMIDITY,
+					   SENSOR_ATTR_LOWER_THRESH, &h_lo) != 0) {
+				printk("BLE: sensor_attr_set humidity low failed\n");
+			}
+			if (sensor_attr_set(sensor_dev, SENSOR_CHAN_HUMIDITY,
+					   SENSOR_ATTR_UPPER_THRESH, &h_hi) != 0) {
+				printk("BLE: sensor_attr_set humidity high failed\n");
+			}
+		}
+
+		printk("BLE: thresholds set (T %.1f-%.1f C, H %d-%d %%RH)\n",
+		       (double)sensor_value_to_float(&alert_temp_lo_val),
+		       (double)sensor_value_to_float(&alert_temp_hi_val),
+		       alert_humidity_lo, alert_humidity_hi);
+		return len;
+	}
+
+	return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
 }
 
 static ssize_t events_char_read(struct bt_conn *conn, const struct bt_gatt_attr *attr,
@@ -484,11 +675,12 @@ int main(void)
 	}
 #endif
 
+	/* Store sensor device for BLE threshold updates */
+	sensor_dev = dev;
+
 	/* Temperature thresholds */
-	temp_lo.val1 = ALERT_TEMP_LO;
-	temp_lo.val2 = 0;
-	temp_hi.val1 = ALERT_TEMP_HI;
-	temp_hi.val2 = 0;
+	temp_lo = alert_temp_lo_val;
+	temp_hi = alert_temp_hi_val;
 	rc = sensor_attr_set(dev, SENSOR_CHAN_AMBIENT_TEMP,
 			     SENSOR_ATTR_LOWER_THRESH, &temp_lo);
 	if (rc) {
@@ -503,9 +695,9 @@ int main(void)
 	}
 
 	/* Humidity thresholds */
-	hum_lo.val1 = ALERT_HUMIDITY_LO;
+	hum_lo.val1 = alert_humidity_lo;
 	hum_lo.val2 = 0;
-	hum_hi.val1 = ALERT_HUMIDITY_HI;
+	hum_hi.val1 = alert_humidity_hi;
 	hum_hi.val2 = 0;
 	rc = sensor_attr_set(dev, SENSOR_CHAN_HUMIDITY,
 			     SENSOR_ATTR_LOWER_THRESH, &hum_lo);
@@ -529,7 +721,7 @@ int main(void)
 	}
 
 	printk("SHT30-D: thresholds (Temp %d-%d C, Hum %d-%d %%RH)\n",
-	       ALERT_TEMP_LO, ALERT_TEMP_HI, ALERT_HUMIDITY_LO, ALERT_HUMIDITY_HI);
+	       DEFAULT_TEMP_LO, DEFAULT_TEMP_HI, DEFAULT_HUMIDITY_LO, DEFAULT_HUMIDITY_HI);
 	printk("SHT30-D: sleeping - wake on threshold breach or Button 1 press\n\n");
 
 #if DT_NODE_HAS_PROP(SW1_NODE, gpios)

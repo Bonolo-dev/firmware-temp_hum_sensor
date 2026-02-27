@@ -66,15 +66,36 @@ When **Button 1 (SW1)** is pressed:
 5. User can connect and fetch `events.log` via GATT (see below).
 6. After 60 seconds, returns to idle connectable advertising (without T/H in manufacturer data).
 
-### 4. Logging Into the Device via BLE (Events Log Retrieval)
+### 4. BLE GATT Commands
 
-To fetch `events.log` over BLE, you must first **press Button 1** to start connectable advertising (device advertises for 60 seconds with T/H in manufacturer data). Then:
+To interact with the device over BLE, **press Button 1** first to start connectable advertising (device advertises for 60 seconds with T/H in manufacturer data). Then:
 
 1. **Connect** to the device (name `TempHum`).
 2. Discover the custom GATT service (128‑bit UUID).
-3. **Write** ASCII `"00"` (2 bytes: `0x30 0x30`) to the **command characteristic**.
-4. **Read** the **events characteristic** to retrieve `events.log` content.
-5. Use long read (blob read) with offset to fetch the full file if it exceeds one ATT_MTU.
+3. **Write** commands to the **command characteristic**, then read from the **events characteristic** when applicable.
+
+#### Opcode 00 – Request Events Log
+
+1. **Write** ASCII `"00"` (2 bytes: `0x30 0x30`) to the command characteristic.
+2. **Read** the events characteristic to retrieve `events.log` content.
+3. Use long read (blob read) with offset to fetch the full file if it exceeds one ATT_MTU.
+
+#### Opcode 01 – Set Thresholds
+
+Write a payload in this format to the command characteristic:
+
+- **Format:** `01|{key}{value}[|{key}{value}...]`
+- **Keys:** `TL` = Temperature Low, `TH` = Temperature High, `HL` = Humidity Low, `HH` = Humidity High
+- **Values:** Temperature supports decimals (e.g. `10.5`); humidity uses integers.
+
+**Examples:**
+
+- `01|TL10.5|TH30` — Set temp range 10.5–30°C
+- `01|HL30|HH90` — Set humidity range 30–90% RH
+- `01|TH35` — Set only temp high to 35°C (temp low unchanged)
+- `01|TL10.5|TH30|HL30|HH90` — Set all four thresholds
+
+**Validation:** Low values must be less than high values for each pair. Invalid combinations return a GATT error.
 
 ---
 
