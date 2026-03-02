@@ -34,6 +34,21 @@ west flash
 
 Connect a serial terminal at 115200 baud to see output.
 
+### DFU build (OTA firmware updates over BLE)
+
+`dfu.conf` enables the **DFU SMP server**: TempHum can *receive* firmware updates over BLE (e.g. from nRF Connect for Mobile, mcumgr, or another SMP client). Use with `--sysbuild` (MCUboot bootloader required):
+
+```bash
+west build -b nrf52840dk/nrf52840 --sysbuild --extra-conf dfu.conf
+west flash
+```
+
+**Build output:** `build/zephyr/app_update.bin` is the signed image for OTA upload. Use mcumgr or nRF Connect for Mobile to upload it.
+
+**Flash layout:** MCUboot occupies the start of flash; the app uses slot-0 and updates are written to slot-1. For large apps, you may need external flash for the secondary slot.
+
+`sysbuild.conf` enables MCUboot as a child image and is picked up automatically when using `--sysbuild`.
+
 ---
 
 ## How It Works – Functional Flow
