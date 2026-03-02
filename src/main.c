@@ -58,6 +58,17 @@
 
 /* Button 1 (SW1 on nRF52840 DK) - wake from idle for manual reading */
 #define SW1_NODE     DT_ALIAS(sw0)
+/* LED0 (Green LED 1 on nRF52840 DK) - on when MCU is up (manual or threshold) */
+#define LED0_NODE    DT_ALIAS(led0)
+
+#if DT_NODE_HAS_PROP(LED0_NODE, gpios)
+static struct gpio_dt_spec led0 = GPIO_DT_SPEC_GET(LED0_NODE, gpios);
+#define led_on()  do { if (gpio_is_ready_dt(&led0)) gpio_pin_set_dt(&led0, 1); } while (0)
+#define led_off() do { if (gpio_is_ready_dt(&led0)) gpio_pin_set_dt(&led0, 0); } while (0)
+#else
+#define led_on()  ((void)0)
+#define led_off() ((void)0)
+#endif
 
 /* GATT service for log retrieval - write "00" to command, read events.log */
 #define LOG_SVC_UUID  0xd4, 0x86, 0x48, 0x24, 0x54, 0xb3, 0x43, 0xa1, \
@@ -952,6 +963,12 @@ int main(void)
 	       DEFAULT_TEMP_LO, DEFAULT_TEMP_HI, DEFAULT_HUMIDITY_LO, DEFAULT_HUMIDITY_HI);
 	printk("SHT30-D: sleeping - wake on threshold breach or Button 1 press\n\n");
 
+#if DT_NODE_HAS_PROP(LED0_NODE, gpios)
+	if (gpio_is_ready_dt(&led0)) {
+		(void)gpio_pin_configure_dt(&led0, GPIO_OUTPUT_INACTIVE);
+	}
+#endif
+
 #if DT_NODE_HAS_PROP(SW1_NODE, gpios)
 	struct k_poll_event events[] = {
 		K_POLL_EVENT_STATIC_INITIALIZER(K_POLL_TYPE_SEM_AVAILABLE,
@@ -996,6 +1013,8 @@ int main(void)
 			(void)k_sem_take(&threshold_sem, K_NO_WAIT); /* consume */
 		}
 
+		led_on(); /* MCU is up (manual or threshold) */
+
 		rc = sensor_sample_fetch(dev);
 		if (rc) {
 			printk("SHT30-D: fetch failed: %d\n", rc);
@@ -1023,6 +1042,7 @@ int main(void)
 
 			k_sleep(K_MSEC(MANUAL_ADV_TIMEOUT_MS));
 			ble_stop_advertise(); /* back to idle connectable */
+			led_off();
 			printk("BLE: back to idle advertising\n\n");
 			continue;
 		}
@@ -1082,6 +1102,7 @@ int main(void)
 
 			if (in_range(&temp, &hum)) {
 				ble_stop_advertise();
+				led_off();
 				/* Log back-to-normal: separate line per quantity */
 				log_append_type('N', true, temp.val1);
 				log_append_type('N', false, hum.val1);
