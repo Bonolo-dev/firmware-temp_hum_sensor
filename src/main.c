@@ -131,21 +131,16 @@ static void delete_logs_work_handler(struct k_work *work)
 static K_WORK_DELAYABLE_DEFINE(delete_logs_work, delete_logs_work_handler);
 
 static uint8_t manuf_data[MANUF_DATA_BUF_SIZE];
-static struct bt_data ad[] = {
-	BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
-	BT_DATA(BT_DATA_MANUFACTURER_DATA, manuf_data, 0),
-};
 static bool ad_active;
-static bool ad_connectable;
 static bool log_requested;
 
-/* Connectable advertising for GATT (Button 1 manual - name in scan response to fit 31-byte limit) */
+/* Unified connectable advertising - same device name & structure for breach and manual modes */
 #define DEVICE_NAME CONFIG_BT_DEVICE_NAME
-static struct bt_data ad_conn[] = {
+static struct bt_data ad_data[] = {
 	BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
 	BT_DATA(BT_DATA_MANUFACTURER_DATA, manuf_data, 0),
 };
-static const struct bt_data sd_conn[] = {
+static const struct bt_data sd_data[] = {
 	BT_DATA(BT_DATA_NAME_COMPLETE, DEVICE_NAME, sizeof(DEVICE_NAME) - 1),
 	BT_DATA_BYTES(BT_DATA_UUID128_ALL, LOG_SVC_UUID),
 };
@@ -360,6 +355,7 @@ static void double_to_sensor_value(double v, struct sensor_value *out);
 static void thresholds_save(void)
 {
 	if (!storage_available) {
+		printk("BLE: thresholds_save skipped - storage not available\n");
 		return;
 	}
 	struct fs_file_t f;
@@ -378,19 +374,23 @@ static void thresholds_save(void)
 		     alert_humidity_lo, alert_humidity_hi);
 	k_mutex_unlock(&threshold_mutex);
 	if (n <= 0 || (size_t)n >= sizeof(buf)) {
+		printk("BLE: thresholds_save snprintf failed n=%d\n", n);
 		return;
 	}
 
 	fs_file_t_init(&f);
-	if (fs_open(&f, PATH_THRESHOLDS, FS_O_CREATE | FS_O_WRITE) != 0) {
+	if (fs_open(&f, PATH_THRESHOLDS, FS_O_CREATE | FS_O_WRITE | FS_O_TRUNC) != 0) {
+		printk("BLE: thresholds_save fs_open failed\n");
 		return;
 	}
 	if (fs_write(&f, buf, (size_t)n) != (ssize_t)n) {
+		printk("BLE: thresholds_save fs_write failed\n");
 		fs_close(&f);
 		return;
 	}
 	fs_sync(&f);
 	fs_close(&f);
+	printk("BLE: thresholds_save ok: %.*s", n - 1, buf);
 }
 
 /* Load thresholds from LittleFS. Returns true if loaded and applied. */
@@ -477,22 +477,24 @@ static void storage_init_work_handler(struct k_work *work)
 
 K_WORK_DELAYABLE_DEFINE(storage_init_work, storage_init_work_handler);
 
-/* Encode breach data as CBOR map: {"t": temp} and/or {"h": humidity} - only breached */
+/* Encode breach data as CBOR map: {"m": "b", "t": temp} and/or {"h": humidity}
+ * "m": "b" = mode breach, so mobile app can distinguish from manual. */
 static size_t cbor_encode_breach(const struct sensor_value *temp,
 				 const struct sensor_value *hum,
 				 uint8_t *buf, size_t buf_len)
 {
 	bool inc_temp = temp_breached(temp);
 	bool inc_hum = hum_breached(hum);
-	size_t map_entries = (inc_temp ? 1 : 0) + (inc_hum ? 1 : 0);
+	size_t map_entries = 1 + (inc_temp ? 1 : 0) + (inc_hum ? 1 : 0); /* +1 for "m" */
 
-	if (map_entries == 0 || buf_len < 4) {
+	if (map_entries == 1 || buf_len < 8) {
 		return 0;
 	}
 
 	ZCBOR_STATE_E(state, 1, buf, buf_len, 0);
 	bool ok = zcbor_map_start_encode(state, map_entries);
 
+	ok = ok && zcbor_tstr_put_lit(state, "m") && zcbor_tstr_put_lit(state, "b");
 	if (inc_temp) {
 		float t = sensor_value_to_float(temp);
 		ok = ok && zcbor_tstr_put_lit(state, "t") && zcbor_float32_put(state, t);
@@ -509,79 +511,56 @@ static size_t cbor_encode_breach(const struct sensor_value *temp,
 	return (size_t)(state->payload_mut - buf);
 }
 
-/* Encode both T and H (for manual Button 1 reading) */
+/* Encode both T and H (for manual Button 1 reading): {"m": "M", "t": temp, "h": humidity}
+ * "m": "M" = mode manual, so mobile app can distinguish from breach. */
 static size_t cbor_encode_full(const struct sensor_value *temp,
 			       const struct sensor_value *hum,
 			       uint8_t *buf, size_t buf_len)
 {
-	if (buf_len < 8) {
+	if (buf_len < 12) {
 		return 0;
 	}
 	ZCBOR_STATE_E(state, 1, buf, buf_len, 0);
-	bool ok = zcbor_map_start_encode(state, 2);
+	bool ok = zcbor_map_start_encode(state, 3);
+	ok = ok && zcbor_tstr_put_lit(state, "m") && zcbor_tstr_put_lit(state, "M");
 	float t = sensor_value_to_float(temp);
 	float h = sensor_value_to_float(hum);
 	ok = ok && zcbor_tstr_put_lit(state, "t") && zcbor_float32_put(state, t);
 	ok = ok && zcbor_tstr_put_lit(state, "h") && zcbor_float32_put(state, h);
-	ok = ok && zcbor_map_end_encode(state, 2);
+	ok = ok && zcbor_map_end_encode(state, 3);
 	return ok ? (size_t)(state->payload_mut - buf) : 0;
 }
 
-static int ble_start_advertise_connectable(const struct sensor_value *temp,
-					   const struct sensor_value *hum)
-{
-	ad_conn[1].data_len = 0;
-	if (temp && hum) {
-		manuf_data[0] = COMPANY_ID & 0xff;
-		manuf_data[1] = (COMPANY_ID >> 8) & 0xff;
-		size_t cbor_len = cbor_encode_full(temp, hum, &manuf_data[2],
-						    MANUF_DATA_BUF_SIZE - 2);
-		ad_conn[1].data_len = 2 + cbor_len;
-	}
-
-	if (ad_active && ad_connectable) {
-		return bt_le_adv_update_data(ad_conn, ARRAY_SIZE(ad_conn),
-					     sd_conn, ARRAY_SIZE(sd_conn));
-	}
-	if (ad_active) {
-		(void)bt_le_adv_stop();
-		ad_active = false;
-	}
-	int err = bt_le_adv_start(BT_LE_ADV_CONN_FAST_2, ad_conn, ARRAY_SIZE(ad_conn),
-				 sd_conn, ARRAY_SIZE(sd_conn));
-	if (!err) {
-		ad_active = true;
-		ad_connectable = true;
-	}
-	return err;
-}
-
-static int ble_start_advertise_breach(const struct sensor_value *temp,
-				      const struct sensor_value *hum)
+/* Unified connectable advertising - same device name for breach and manual modes.
+ * breach_only: true = CBOR encodes only breached values; false = both T and H. */
+static int ble_start_advertise(const struct sensor_value *temp,
+			       const struct sensor_value *hum,
+			       bool breach_only)
 {
 	manuf_data[0] = COMPANY_ID & 0xff;
 	manuf_data[1] = (COMPANY_ID >> 8) & 0xff;
 
-	size_t cbor_len = cbor_encode_breach(temp, hum, &manuf_data[2],
+	size_t cbor_len;
+	if (breach_only) {
+		cbor_len = cbor_encode_breach(temp, hum, &manuf_data[2],
 					     MANUF_DATA_BUF_SIZE - 2);
-	if (cbor_len == 0) {
-		return -EINVAL;
+		if (cbor_len == 0) {
+			return -EINVAL;
+		}
+	} else {
+		cbor_len = cbor_encode_full(temp, hum, &manuf_data[2],
+					    MANUF_DATA_BUF_SIZE - 2);
 	}
+	ad_data[1].data_len = 2 + cbor_len;
 
-	ad[1].data_len = 2 + cbor_len;
-
-	if (ad_active && !ad_connectable) {
-		return bt_le_adv_update_data(ad, ARRAY_SIZE(ad), NULL, 0);
-	}
 	if (ad_active) {
-		(void)bt_le_adv_stop();
-		ad_active = false;
+		return bt_le_adv_update_data(ad_data, ARRAY_SIZE(ad_data),
+					     sd_data, ARRAY_SIZE(sd_data));
 	}
-
-	int err = bt_le_adv_start(BT_LE_ADV_NCONN, ad, ARRAY_SIZE(ad), NULL, 0);
+	int err = bt_le_adv_start(BT_LE_ADV_CONN_FAST_2, ad_data, ARRAY_SIZE(ad_data),
+				  sd_data, ARRAY_SIZE(sd_data));
 	if (!err) {
 		ad_active = true;
-		ad_connectable = false;
 	}
 	return err;
 }
@@ -594,7 +573,6 @@ static int ble_stop_advertise(void)
 	int err = bt_le_adv_stop();
 	if (!err) {
 		ad_active = false;
-		ad_connectable = false;
 	}
 	return err;
 }
@@ -649,6 +627,7 @@ static ssize_t cmd_char_write(struct bt_conn *conn, const struct bt_gatt_attr *a
 
 	/* Opcode 01: set thresholds - 01|TL10.5|TH30|HL30|HH90 or 01|RS to reset to defaults */
 	if (((const char *)buf)[0] == '0' && ((const char *)buf)[1] == '1') {
+		printk("BLE: received threshold command (len=%u)\n", (unsigned)len);
 		char cmd_buf[CMD_BUF_MAX];
 		char *tok;
 		bool has_tl = false, has_th = false, has_hl = false, has_hh = false;
@@ -1033,7 +1012,7 @@ int main(void)
 			log_append_type('M', true, temp.val1);
 			log_append_type('M', false, hum.val1);
 
-			rc = ble_start_advertise_connectable(&temp, &hum);
+			rc = ble_start_advertise(&temp, &hum, false);
 			if (rc) {
 				printk("BLE manual advertise failed: %d\n", rc);
 			} else {
@@ -1064,7 +1043,7 @@ int main(void)
 
 		/* Advertise only when we have breach data (avoids -EINVAL from empty payload) */
 		if (temp_breached(&temp) || hum_breached(&hum)) {
-			rc = ble_start_advertise_breach(&temp, &hum);
+			rc = ble_start_advertise(&temp, &hum, true);
 			if (rc) {
 				printk("BLE advertise start failed: %d\n", rc);
 			} else {
@@ -1124,7 +1103,7 @@ int main(void)
 			}
 			/* Update advertising when we have breach data */
 			if (temp_breached(&temp) || hum_breached(&hum)) {
-				ble_start_advertise_breach(&temp, &hum);
+				ble_start_advertise(&temp, &hum, true);
 			}
 		}
 	}

@@ -65,10 +65,10 @@ When temperature or humidity goes outside the configured range (see `ALERT_TEMP_
 1. SHT30-D drives ALERT high → MCU wakes.
 2. Sensor reads current T/H.
 3. Logs breach lines to `events.log` (format: `{recycle}|{uptime}A|T{val}` or `H{val}`).
-4. Switches to **non-connectable BLE advertising** with CBOR payload (only breached values).
+4. Switches to **connectable BLE advertising** with CBOR payload (only breached values).
 5. Polls sensor every 2 seconds until values return to normal.
 6. Logs back-to-normal lines (`...N|...`).
-7. Stops breach advertising and returns to **idle (connectable)** advertising.
+7. Stops breach advertising and returns to idle (no advertising).
 
 ### 3. Button 1 – Manual Reading
 
@@ -83,7 +83,7 @@ When **Button 1 (SW1)** is pressed:
 
 ### 4. BLE GATT Commands
 
-To interact with the device over BLE, **press Button 1** first to start connectable advertising (device advertises for 60 seconds with T/H in manufacturer data). Then:
+To interact with the device over BLE, connect when it is advertising (either during a threshold breach or after pressing Button 1). During breach, the device advertises connectable with breach data; after Button 1, it advertises for 60 seconds with both T and H. Then:
 
 1. **Connect** to the device (name `TempHum`).
 2. Discover the custom GATT service (128‑bit UUID).
@@ -149,16 +149,23 @@ Example:
 
 ## BLE Advertising Summary
 
-| State             | Mode               | T/H in advertisement?   |
-|-------------------|--------------------|-------------------------|
-| Idle              | None               | —                       |
-| Threshold breach  | Non-connectable   | Yes (breached only)     |
-| Button 1 manual   | Connectable       | Yes (both T and H)      |
+| State             | Mode        | T/H in advertisement?   |
+|-------------------|-------------|-------------------------|
+| Idle              | None        | —                       |
+| Threshold breach  | Connectable | Yes (breached only)     |
+| Button 1 manual   | Connectable | Yes (both T and H)      |
+
+Both breach and manual modes use the same connectable advertising with device name `TempHum`, so scanners show a single device. You can connect during a breach (e.g. to fetch logs or set thresholds) without pressing Button 1 first.
 
 **CBOR payload** (when T/H are advertised):
 
-- `{"t": 36.5}` – temperature only
-- `{"h": 85.2}` – humidity only
-- `{"t": 36.5, "h": 85.2}` – both (manual or both breached)
+| Mode    | `m` field | Example                                      |
+|---------|-----------|----------------------------------------------|
+| Breach  | `"b"`     | `{"m": "b", "t": 36.5}` – temp breached      |
+| Breach  | `"b"`     | `{"m": "b", "h": 85.2}` – humidity breached |
+| Breach  | `"b"`     | `{"m": "b", "t": 36.5, "h": 85.2}` – both   |
+| Manual  | `"M"`     | `{"m": "M", "t": 23.5, "h": 65.2}` – Button 1 |
+
+The mobile app should check the `m` field: `"b"` = threshold breach, `"M"` = manual reading.
 
 Use a BLE scanner (e.g. nRF Connect app) and a CBOR decoder to read manufacturer data.
