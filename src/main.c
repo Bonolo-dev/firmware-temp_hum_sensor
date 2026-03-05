@@ -31,7 +31,6 @@
 #include <zephyr/bluetooth/gatt.h>
 #include <zephyr/bluetooth/uuid.h>
 #include <zephyr/fs/fs.h>
-#include <zephyr/sys/reboot.h>
 #include <zephyr/sys/util.h>
 #include <zcbor_encode.h>
 #include <zcbor_common.h>
@@ -85,7 +84,7 @@ static K_SEM_DEFINE(threshold_sem, 0, 1);
 static K_SEM_DEFINE(button_sem, 0, 1);
 
 #define STORAGE_INIT_DELAY_MS  2000
-#define REBOOT_DELAY_MS        1000  /* Defer reboot so BLE write completes */
+#define THRESHOLD_APPLY_DELAY_MS  500  /* Defer save/apply so GATT write response completes */
 
 /* Persisted across power cycles */
 static uint32_t recycle_count;
@@ -103,17 +102,146 @@ static const struct device *sensor_dev;
 
 /* Forward decl */
 static void thresholds_save(void);
+static void double_to_sensor_value(double v, struct sensor_value *out);
+static int ble_start_advertise(const struct sensor_value *temp,
+			       const struct sensor_value *hum,
+			       bool breach_only);
 
-/* Save thresholds + reboot - must run in work queue, not BLE callback.
- * BLE callback has limited stack and FS ops can block/deadlock there. */
-static void save_and_reboot_work_handler(struct k_work *work)
+/* Pending threshold command - copied in callback, parsed in work (avoids BLE callback stack) */
+static char threshold_cmd_buf[CMD_BUF_MAX];
+static uint16_t threshold_cmd_len;
+
+/* Parse threshold command and apply - runs in work queue, not BLE callback.
+ * Callback only copies data and schedules; parsing here avoids stack overflow and
+ * ensures we never return GATT error (which can cause client to disconnect). */
+static void threshold_parse_and_apply_work_handler(struct k_work *work)
 {
 	ARG_UNUSED(work);
+	char cmd_buf[CMD_BUF_MAX];
+	char *tok;
+	bool has_tl = false, has_th = false, has_hl = false, has_hh = false;
+	bool has_rs = false;
+	struct sensor_value new_tl, new_th;
+	int new_hl, new_hh;
+
+	if (threshold_cmd_len >= CMD_BUF_MAX || threshold_cmd_len < 4) {
+		printk("BLE: threshold command invalid len=%u\n", (unsigned)threshold_cmd_len);
+		return;
+	}
+	memcpy(cmd_buf, threshold_cmd_buf, threshold_cmd_len);
+	cmd_buf[threshold_cmd_len] = '\0';
+
+	k_mutex_lock(&threshold_mutex, K_FOREVER);
+	new_tl = alert_temp_lo_val;
+	new_th = alert_temp_hi_val;
+	new_hl = alert_humidity_lo;
+	new_hh = alert_humidity_hi;
+	k_mutex_unlock(&threshold_mutex);
+
+	tok = strtok(cmd_buf, "|");
+	if (!tok || strlen(tok) != 2 || tok[0] != '0' || tok[1] != '1') {
+		printk("BLE: threshold parse failed (bad opcode)\n");
+		return;
+	}
+
+	while ((tok = strtok(NULL, "|")) != NULL) {
+		if (strlen(tok) == 2 && tok[0] == 'R' && tok[1] == 'S') {
+			has_rs = true;
+			break;
+		}
+		if (strlen(tok) < 3) {
+			continue;
+		}
+		char *end;
+		double fval = strtod(tok + 2, &end);
+		if (end == tok + 2) {
+			continue;
+		}
+		if (tok[0] == 'T' && tok[1] == 'L') {
+			has_tl = true;
+			double_to_sensor_value(fval, &new_tl);
+		} else if (tok[0] == 'T' && tok[1] == 'H') {
+			has_th = true;
+			double_to_sensor_value(fval, &new_th);
+		} else if (tok[0] == 'H' && tok[1] == 'L') {
+			has_hl = true;
+			new_hl = (int)fval;
+		} else if (tok[0] == 'H' && tok[1] == 'H') {
+			has_hh = true;
+			new_hh = (int)fval;
+		}
+	}
+
+	if (has_rs) {
+		new_tl.val1 = DEFAULT_TEMP_LO;
+		new_tl.val2 = 0;
+		new_th.val1 = DEFAULT_TEMP_HI;
+		new_th.val2 = 0;
+		new_hl = DEFAULT_HUMIDITY_LO;
+		new_hh = DEFAULT_HUMIDITY_HI;
+		has_tl = has_th = has_hl = has_hh = true;
+	}
+
+	float tl_f = sensor_value_to_float(&new_tl);
+	float th_f = sensor_value_to_float(&new_th);
+	if (has_tl && has_th && tl_f >= th_f) {
+		printk("BLE: threshold error: TL must be < TH\n");
+		return;
+	}
+	if (has_hl && has_hh && new_hl >= new_hh) {
+		printk("BLE: threshold error: HL must be < HH\n");
+		return;
+	}
+	if (has_tl && !has_th) {
+		float th_cur = sensor_value_to_float(&alert_temp_hi_val);
+		if (tl_f >= th_cur) { printk("BLE: threshold error: TL >= current TH\n"); return; }
+	}
+	if (has_th && !has_tl) {
+		float tl_cur = sensor_value_to_float(&alert_temp_lo_val);
+		if (tl_cur >= th_f) { printk("BLE: threshold error: current TL >= TH\n"); return; }
+	}
+	if (has_hl && !has_hh && new_hl >= alert_humidity_hi) {
+		printk("BLE: threshold error: HL >= current HH\n"); return;
+	}
+	if (has_hh && !has_hl && alert_humidity_lo >= new_hh) {
+		printk("BLE: threshold error: current HL >= HH\n"); return;
+	}
+	k_mutex_lock(&threshold_mutex, K_FOREVER);
+	if (has_tl) { alert_temp_lo_val = new_tl; }
+	if (has_th) { alert_temp_hi_val = new_th; }
+	if (has_hl) { alert_humidity_lo = new_hl; }
+	if (has_hh) { alert_humidity_hi = new_hh; }
+	k_mutex_unlock(&threshold_mutex);
+
 	thresholds_save();
-	printk("BLE: saved, rebooting to apply thresholds\n");
-	sys_reboot(SYS_REBOOT_COLD);
+	if (sensor_dev && device_is_ready(sensor_dev)) {
+		struct sensor_value t_lo, t_hi, h_lo, h_hi;
+		k_mutex_lock(&threshold_mutex, K_FOREVER);
+		t_lo = alert_temp_lo_val;
+		t_hi = alert_temp_hi_val;
+		h_lo.val1 = alert_humidity_lo;
+		h_lo.val2 = 0;
+		h_hi.val1 = alert_humidity_hi;
+		h_hi.val2 = 0;
+		k_mutex_unlock(&threshold_mutex);
+		if (sensor_attr_set(sensor_dev, SENSOR_CHAN_AMBIENT_TEMP,
+				    SENSOR_ATTR_LOWER_THRESH, &t_lo) == 0 &&
+		    sensor_attr_set(sensor_dev, SENSOR_CHAN_AMBIENT_TEMP,
+				    SENSOR_ATTR_UPPER_THRESH, &t_hi) == 0 &&
+		    sensor_attr_set(sensor_dev, SENSOR_CHAN_HUMIDITY,
+				    SENSOR_ATTR_LOWER_THRESH, &h_lo) == 0 &&
+		    sensor_attr_set(sensor_dev, SENSOR_CHAN_HUMIDITY,
+				    SENSOR_ATTR_UPPER_THRESH, &h_hi) == 0) {
+			printk("BLE: thresholds applied (T %d.%d-%d.%d C, H %d-%d %%RH)\n",
+			       t_lo.val1,
+			       (int)((t_lo.val2 < 0 ? -t_lo.val2 : t_lo.val2) * 10 / 1000000),
+			       t_hi.val1,
+			       (int)((t_hi.val2 < 0 ? -t_hi.val2 : t_hi.val2) * 10 / 1000000),
+			       h_lo.val1, h_hi.val1);
+		}
+	}
 }
-static K_WORK_DELAYABLE_DEFINE(save_and_reboot_work, save_and_reboot_work_handler);
+static K_WORK_DELAYABLE_DEFINE(threshold_parse_and_apply_work, threshold_parse_and_apply_work_handler);
 
 /* Delete events.log - runs in work queue (not BLE callback) */
 static void delete_logs_work_handler(struct k_work *work)
@@ -133,6 +261,27 @@ static K_WORK_DELAYABLE_DEFINE(delete_logs_work, delete_logs_work_handler);
 static uint8_t manuf_data[MANUF_DATA_BUF_SIZE];
 static bool ad_active;
 static bool log_requested;
+/* Last breach T/H - used to restart advertising when peer disconnects (BLE stops adv on connect) */
+static struct sensor_value last_breach_temp;
+static struct sensor_value last_breach_hum;
+static bool had_breach_adv;  /* true when we were advertising breach at time of connection */
+
+#define RESTART_ADV_DELAY_MS  150  /* Delay before restart - stack needs time to release resources */
+
+static void restart_breach_adv_work_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+	if (!had_breach_adv) {
+		return;
+	}
+	int rc = ble_start_advertise(&last_breach_temp, &last_breach_hum, true);
+	if (rc) {
+		printk("BLE: restart adv after disconnect failed: %d\n", rc);
+	} else {
+		printk("BLE: advertising breach (restarted after disconnect)\n");
+	}
+}
+static K_WORK_DELAYABLE_DEFINE(restart_breach_adv_work, restart_breach_adv_work_handler);
 
 /* Unified connectable advertising - same device name & structure for breach and manual modes */
 #define DEVICE_NAME CONFIG_BT_DEVICE_NAME
@@ -540,6 +689,12 @@ static int ble_start_advertise(const struct sensor_value *temp,
 	manuf_data[0] = COMPANY_ID & 0xff;
 	manuf_data[1] = (COMPANY_ID >> 8) & 0xff;
 
+	had_breach_adv = breach_only;
+	if (breach_only && temp && hum) {
+		last_breach_temp = *temp;
+		last_breach_hum = *hum;
+	}
+
 	size_t cbor_len;
 	if (breach_only) {
 		cbor_len = cbor_encode_breach(temp, hum, &manuf_data[2],
@@ -567,6 +722,7 @@ static int ble_start_advertise(const struct sensor_value *temp,
 
 static int ble_stop_advertise(void)
 {
+	had_breach_adv = false;
 	if (!ad_active) {
 		return 0;
 	}
@@ -625,139 +781,17 @@ static ssize_t cmd_char_write(struct bt_conn *conn, const struct bt_gatt_attr *a
 		return len;
 	}
 
-	/* Opcode 01: set thresholds - 01|TL10.5|TH30|HL30|HH90 or 01|RS to reset to defaults */
+	/* Opcode 01: set thresholds - copy to buffer, parse in work queue.
+	 * Always return success to avoid GATT error that can cause client disconnect.
+	 * Parsing deferred to avoid BLE callback stack overflow. */
 	if (((const char *)buf)[0] == '0' && ((const char *)buf)[1] == '1') {
-		printk("BLE: received threshold command (len=%u)\n", (unsigned)len);
-		char cmd_buf[CMD_BUF_MAX];
-		char *tok;
-		bool has_tl = false, has_th = false, has_hl = false, has_hh = false;
-		bool has_rs = false;
-		struct sensor_value new_tl;
-		struct sensor_value new_th;
-		int new_hl;
-		int new_hh;
-
 		if (len >= CMD_BUF_MAX) {
 			return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
 		}
-		memcpy(cmd_buf, buf, len);
-		cmd_buf[len] = '\0';
-
-		k_mutex_lock(&threshold_mutex, K_FOREVER);
-		new_tl = alert_temp_lo_val;
-		new_th = alert_temp_hi_val;
-		new_hl = alert_humidity_lo;
-		new_hh = alert_humidity_hi;
-		k_mutex_unlock(&threshold_mutex);
-
-		tok = strtok(cmd_buf, "|");
-		if (!tok || strlen(tok) != 2 || tok[0] != '0' || tok[1] != '1') {
-			return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
-		}
-
-		while ((tok = strtok(NULL, "|")) != NULL) {
-			if (strlen(tok) == 2 && tok[0] == 'R' && tok[1] == 'S') {
-				has_rs = true;
-				break;
-			}
-			if (strlen(tok) < 3) {
-				continue;
-			}
-			double fval;
-			char *end;
-			fval = strtod(tok + 2, &end);
-			if (end == tok + 2) {
-				return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
-			}
-
-			if (tok[0] == 'T' && tok[1] == 'L') {
-				has_tl = true;
-				double_to_sensor_value(fval, &new_tl);
-			} else if (tok[0] == 'T' && tok[1] == 'H') {
-				has_th = true;
-				double_to_sensor_value(fval, &new_th);
-			} else if (tok[0] == 'H' && tok[1] == 'L') {
-				has_hl = true;
-				new_hl = (int)fval;
-			} else if (tok[0] == 'H' && tok[1] == 'H') {
-				has_hh = true;
-				new_hh = (int)fval;
-			}
-		}
-
-		if (has_rs) {
-			new_tl.val1 = DEFAULT_TEMP_LO;
-			new_tl.val2 = 0;
-			new_th.val1 = DEFAULT_TEMP_HI;
-			new_th.val2 = 0;
-			new_hl = DEFAULT_HUMIDITY_LO;
-			new_hh = DEFAULT_HUMIDITY_HI;
-			has_tl = has_th = has_hl = has_hh = true;
-		}
-
-		/* Validation: low must be < high for each pair */
-		{
-			float tl_f = sensor_value_to_float(&new_tl);
-			float th_f = sensor_value_to_float(&new_th);
-			if (has_tl && has_th && tl_f >= th_f) {
-				printk("BLE: threshold error: TL (%d.%d) must be < TH (%d.%d)\n",
-				       new_tl.val1,
-				       (int)((new_tl.val2 < 0 ? -new_tl.val2 : new_tl.val2) * 10 / 1000000),
-				       new_th.val1,
-				       (int)((new_th.val2 < 0 ? -new_th.val2 : new_th.val2) * 10 / 1000000));
-				return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
-			}
-			if (has_hl && has_hh && new_hl >= new_hh) {
-				printk("BLE: threshold error: HL (%d) must be < HH (%d)\n",
-				       new_hl, new_hh);
-				return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
-			}
-			/* Validate new values against existing if only one of pair is updated */
-			if (has_tl && !has_th) {
-				float th_f_cur = sensor_value_to_float(&alert_temp_hi_val);
-				if (tl_f >= th_f_cur) {
-					return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
-				}
-			}
-			if (has_th && !has_tl) {
-				float tl_f_cur = sensor_value_to_float(&alert_temp_lo_val);
-				if (tl_f_cur >= th_f) {
-					return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
-				}
-			}
-			if (has_hl && !has_hh && new_hl >= alert_humidity_hi) {
-				return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
-			}
-			if (has_hh && !has_hl && alert_humidity_lo >= new_hh) {
-				return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
-			}
-		}
-
-		k_mutex_lock(&threshold_mutex, K_FOREVER);
-		if (has_tl) {
-			alert_temp_lo_val = new_tl;
-		}
-		if (has_th) {
-			alert_temp_hi_val = new_th;
-		}
-		if (has_hl) {
-			alert_humidity_lo = new_hl;
-		}
-		if (has_hh) {
-			alert_humidity_hi = new_hh;
-		}
-		k_mutex_unlock(&threshold_mutex);
-
-		printk("BLE: thresholds set (T %d.%d-%d.%d C, H %d-%d %%RH)\n",
-		       alert_temp_lo_val.val1,
-		       (int)((alert_temp_lo_val.val2 < 0 ? -alert_temp_lo_val.val2 :
-			      alert_temp_lo_val.val2) * 10 / 1000000),
-		       alert_temp_hi_val.val1,
-		       (int)((alert_temp_hi_val.val2 < 0 ? -alert_temp_hi_val.val2 :
-			      alert_temp_hi_val.val2) * 10 / 1000000),
-		       alert_humidity_lo, alert_humidity_hi);
-		printk("BLE: scheduling save & reboot in %d ms\n", REBOOT_DELAY_MS);
-		k_work_schedule(&save_and_reboot_work, K_MSEC(REBOOT_DELAY_MS));
+		memcpy(threshold_cmd_buf, buf, len);
+		threshold_cmd_len = len;
+		printk("BLE: threshold command queued (len=%u)\n", (unsigned)len);
+		k_work_schedule(&threshold_parse_and_apply_work, K_MSEC(100));
 		return len;
 	}
 
@@ -814,6 +848,8 @@ static void conn_connected(struct bt_conn *conn, uint8_t err)
 	if (err) {
 		return;
 	}
+	/* BLE stack stops advertising when connected; keep our state in sync */
+	ad_active = false;
 	char addr[BT_ADDR_LE_STR_LEN];
 	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
 	printk("BLE: connected %s\n", addr);
@@ -825,6 +861,12 @@ static void conn_disconnected(struct bt_conn *conn, uint8_t reason)
 	char addr[BT_ADDR_LE_STR_LEN];
 	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
 	printk("BLE: disconnected %s (reason %u)\n", addr, reason);
+	/* Restart advertising when peer disconnects - stack does not auto-restart.
+	 * Defer to work queue: calling bt_le_adv_start from disconnect callback can
+	 * fail with -12 (ENOMEM) because stack hasn't released resources yet. */
+	if (had_breach_adv) {
+		k_work_schedule(&restart_breach_adv_work, K_MSEC(RESTART_ADV_DELAY_MS));
+	}
 }
 
 BT_CONN_CB_DEFINE(conn_callbacks) = {
