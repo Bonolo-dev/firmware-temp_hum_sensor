@@ -1020,8 +1020,15 @@ int main(void)
 			}
 
 			k_sleep(K_MSEC(MANUAL_ADV_TIMEOUT_MS));
-			ble_stop_advertise(); /* back to idle connectable */
+			ble_stop_advertise(); /* back to idle */
 			led_off();
+			/* Re-arm threshold trigger. After BLE advertising, the ALERT interrupt
+			 * can fail to fire for subsequent breaches until power cycle. Re-calling
+			 * sensor_trigger_set ensures the GPIO interrupt is properly enabled and
+			 * processes any breach that occurred during the 60s (ALERT already high). */
+			(void)sensor_trigger_set(dev, &trig, trigger_handler);
+			/* Brief delay so BLE stack fully releases radio before returning to k_poll */
+			k_sleep(K_MSEC(100));
 			printk("BLE: back to idle advertising\n\n");
 			continue;
 		}
