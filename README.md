@@ -36,7 +36,7 @@ Connect a serial terminal at 115200 baud to see output.
 
 ### DFU build (OTA firmware updates over BLE)
 
-`dfu.conf` enables the **DFU SMP server**: TempHum can *receive* firmware updates over BLE (e.g. from nRF Connect for Mobile, mcumgr, or another SMP client). Use with `--sysbuild` (MCUboot bootloader required):
+`dfu.conf` enables the **DFU SMP server**: BMWatcherX can *receive* firmware updates over BLE (e.g. from nRF Connect for Mobile, mcumgr, or another SMP client). Use with `--sysbuild` (MCUboot bootloader required):
 
 ```bash
 west build -b nrf52840dk/nrf52840 --sysbuild --extra-conf dfu.conf
@@ -85,15 +85,17 @@ When **Button 1 (SW1)** is pressed:
 
 To interact with the device over BLE, connect when it is advertising (either during a threshold breach or after pressing Button 1). During breach, the device advertises connectable with breach data; after Button 1, it advertises for 60 seconds with both T and H. Then:
 
-1. **Connect** to the device (name `TempHum`).
+1. **Connect** to the device (name `BMWatcherX`).
 2. Discover the custom GATT service (128‑bit UUID).
-3. **Write** commands to the **command characteristic**, then read from the **events characteristic** when applicable.
+3. **Write** commands to the **command characteristic**, then read from the **events characteristic** (for logs) or **thresholds characteristic** (for thresholds) as applicable.
 
-#### Opcode 00 – Request Events Log / Delete Logs
+#### Opcode 00 – Request Events Log / Thresholds / Delete Logs
 
 1. **Write** ASCII `"00"` (2 bytes: `0x30 0x30`) to the command characteristic.
 2. **Read** the events characteristic to retrieve `events.log` content.
 3. Use long read (blob read) with offset to fetch the full file if it exceeds one ATT_MTU.
+
+**Get thresholds:** Write `00|THR` (6 bytes: `30 30 7C 54 48 52`) to the command characteristic, then **read** the **thresholds characteristic** to receive the current thresholds as CBOR in the same format used for setting: `{"op":1,"TL":10.5,"TH":30,"HL":30,"HH":90}`.
 
 **Delete all logs:** Write `00|RS` (5 bytes) to delete `events.log`. The file is removed from LittleFS immediately.
 
@@ -155,7 +157,7 @@ Example:
 | Threshold breach  | Connectable | Yes (breached only)     |
 | Button 1 manual   | Connectable | Yes (both T and H)      |
 
-Both breach and manual modes use the same connectable advertising with device name `TempHum`, so scanners show a single device. You can connect during a breach (e.g. to fetch logs or set thresholds) without pressing Button 1 first.
+Both breach and manual modes use the same connectable advertising with device name `BMWatcherX`, so scanners show a single device. You can connect during a breach (e.g. to fetch logs or set thresholds) without pressing Button 1 first.
 
 **CBOR payload** (when T/H are advertised):
 

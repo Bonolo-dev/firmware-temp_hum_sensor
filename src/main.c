@@ -76,9 +76,12 @@ static struct gpio_dt_spec led0 = GPIO_DT_SPEC_GET(LED0_NODE, gpios);
 		     0x95, 0xd4, 0x9d, 0xcc, 0x08, 0x4f, 0xcf, 0x6a
 #define EVENTS_CHAR_UUID 0xb7, 0xf9, 0xd5, 0x71, 0x8f, 0xbb, 0x52, 0x7c, \
 			 0xa6, 0xe5, 0xae, 0xdd, 0x19, 0x60, 0xd0, 0x7b
-#define BT_UUID_LOG_SVC     BT_UUID_DECLARE_128(LOG_SVC_UUID)
-#define BT_UUID_CMD_CHAR    BT_UUID_DECLARE_128(CMD_CHAR_UUID)
-#define BT_UUID_EVENTS_CHAR BT_UUID_DECLARE_128(EVENTS_CHAR_UUID)
+#define THRESHOLDS_CHAR_UUID 0xc8, 0x0a, 0xe6, 0x71, 0x9f, 0xcc, 0x63, 0x8d, \
+			    0xb7, 0xf6, 0xbf, 0xee, 0x2a, 0x71, 0xe1, 0x8c
+#define BT_UUID_LOG_SVC        BT_UUID_DECLARE_128(LOG_SVC_UUID)
+#define BT_UUID_CMD_CHAR       BT_UUID_DECLARE_128(CMD_CHAR_UUID)
+#define BT_UUID_EVENTS_CHAR    BT_UUID_DECLARE_128(EVENTS_CHAR_UUID)
+#define BT_UUID_THRESHOLDS_CHAR BT_UUID_DECLARE_128(THRESHOLDS_CHAR_UUID)
 
 static K_SEM_DEFINE(threshold_sem, 0, 1);
 static K_SEM_DEFINE(button_sem, 0, 1);
@@ -261,6 +264,7 @@ static K_WORK_DELAYABLE_DEFINE(delete_logs_work, delete_logs_work_handler);
 static uint8_t manuf_data[MANUF_DATA_BUF_SIZE];
 static bool ad_active;
 static bool log_requested;
+static bool thresholds_requested;
 /* Last breach T/H - used to restart advertising when peer disconnects (BLE stops adv on connect) */
 static struct sensor_value last_breach_temp;
 static struct sensor_value last_breach_hum;
@@ -680,6 +684,32 @@ static size_t cbor_encode_full(const struct sensor_value *temp,
 	return ok ? (size_t)(state->payload_mut - buf) : 0;
 }
 
+/* Encode thresholds as CBOR map: {"op":1,"TL":x,"TH":x,"HL":x,"HH":x} - same format as set. */
+static size_t cbor_encode_thresholds(uint8_t *buf, size_t buf_len)
+{
+	if (buf_len < 24) {
+		return 0;
+	}
+	float tl_f, th_f;
+
+	k_mutex_lock(&threshold_mutex, K_FOREVER);
+	tl_f = sensor_value_to_float(&alert_temp_lo_val);
+	th_f = sensor_value_to_float(&alert_temp_hi_val);
+	ZCBOR_STATE_E(state, 1, buf, buf_len, 0);
+	bool ok = zcbor_map_start_encode(state, 5);
+	ok = ok && zcbor_tstr_put_lit(state, "op") && zcbor_uint32_put(state, 1);
+	ok = ok && zcbor_tstr_put_lit(state, "TL") && zcbor_float32_put(state, tl_f);
+	ok = ok && zcbor_tstr_put_lit(state, "TH") && zcbor_float32_put(state, th_f);
+	ok = ok && zcbor_tstr_put_lit(state, "HL") && zcbor_float32_put(state,
+		(float)alert_humidity_lo);
+	ok = ok && zcbor_tstr_put_lit(state, "HH") && zcbor_float32_put(state,
+		(float)alert_humidity_hi);
+	ok = ok && zcbor_map_end_encode(state, 5);
+	k_mutex_unlock(&threshold_mutex);
+
+	return ok ? (size_t)(state->payload_mut - buf) : 0;
+}
+
 /* Unified connectable advertising - same device name for breach and manual modes.
  * breach_only: true = CBOR encodes only breached values; false = both T and H. */
 static int ble_start_advertise(const struct sensor_value *temp,
@@ -766,10 +796,16 @@ static ssize_t cmd_char_write(struct bt_conn *conn, const struct bt_gatt_attr *a
 		return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
 	}
 
-	/* Opcode 00: request events.log, or 00|RS to delete all logs */
+	/* Opcode 00: request events.log, 00|THR for thresholds, or 00|RS to delete logs */
 	if (((const char *)buf)[0] == '0' && ((const char *)buf)[1] == '0') {
-		if (len >= 5 && ((const char *)buf)[2] == '|' &&
-		    ((const char *)buf)[3] == 'R' && ((const char *)buf)[4] == 'S') {
+		if (len >= 6 && ((const char *)buf)[2] == '|' &&
+		    ((const char *)buf)[3] == 'T' && ((const char *)buf)[4] == 'H' &&
+		    ((const char *)buf)[5] == 'R') {
+			/* 00|THR - request thresholds (CBOR) for read */
+			thresholds_requested = true;
+			printk("BLE: user requested thresholds (code 00|THR)\n");
+		} else if (len >= 5 && ((const char *)buf)[2] == '|' &&
+			   ((const char *)buf)[3] == 'R' && ((const char *)buf)[4] == 'S') {
 			/* 00|RS - delete events.log */
 			printk("BLE: user requested log delete (code 00|RS)\n");
 			k_work_schedule(&delete_logs_work, K_NO_WAIT);
@@ -831,6 +867,33 @@ static ssize_t events_char_read(struct bt_conn *conn, const struct bt_gatt_attr 
 	return (n >= 0) ? (ssize_t)n : BT_GATT_ERR(BT_ATT_ERR_UNLIKELY);
 }
 
+#define THRESHOLDS_CBOR_BUF_SIZE 48
+
+static ssize_t thresholds_char_read(struct bt_conn *conn, const struct bt_gatt_attr *attr,
+				   void *buf, uint16_t len, uint16_t offset)
+{
+	ARG_UNUSED(conn);
+	ARG_UNUSED(attr);
+
+	if (!thresholds_requested) {
+		return BT_GATT_ERR(BT_ATT_ERR_READ_NOT_PERMITTED);
+	}
+	if (offset > 0) {
+		return BT_GATT_ERR(BT_ATT_ERR_INVALID_OFFSET);
+	}
+
+	static uint8_t cbor_buf[THRESHOLDS_CBOR_BUF_SIZE];
+	size_t cbor_len = cbor_encode_thresholds(cbor_buf, sizeof(cbor_buf));
+	if (cbor_len == 0) {
+		return BT_GATT_ERR(BT_ATT_ERR_UNLIKELY);
+	}
+
+	thresholds_requested = false;
+	size_t to_copy = (len < cbor_len) ? len : cbor_len;
+	memcpy(buf, cbor_buf, to_copy);
+	return (ssize_t)to_copy;
+}
+
 BT_GATT_SERVICE_DEFINE(log_svc,
 	BT_GATT_PRIMARY_SERVICE(BT_UUID_LOG_SVC),
 	BT_GATT_CHARACTERISTIC(BT_UUID_CMD_CHAR,
@@ -841,6 +904,10 @@ BT_GATT_SERVICE_DEFINE(log_svc,
 			      BT_GATT_CHRC_READ,
 			      BT_GATT_PERM_READ,
 			      events_char_read, NULL, NULL),
+	BT_GATT_CHARACTERISTIC(BT_UUID_THRESHOLDS_CHAR,
+			      BT_GATT_CHRC_READ,
+			      BT_GATT_PERM_READ,
+			      thresholds_char_read, NULL, NULL),
 );
 
 static void conn_connected(struct bt_conn *conn, uint8_t err)
@@ -858,6 +925,7 @@ static void conn_connected(struct bt_conn *conn, uint8_t err)
 static void conn_disconnected(struct bt_conn *conn, uint8_t reason)
 {
 	log_requested = false;
+	thresholds_requested = false;
 	char addr[BT_ADDR_LE_STR_LEN];
 	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
 	printk("BLE: disconnected %s (reason %u)\n", addr, reason);
